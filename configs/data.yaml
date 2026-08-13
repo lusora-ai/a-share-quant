@@ -1,0 +1,21 @@
+# Data Pipeline Configuration
+providers:
+  primary: "akshare"
+  fallback: "baostock"
+
+download:
+  start_date: "2018-01-01"
+  end_date: null  # null means today
+  adjust: "hfq"   # hfq: 后复权, qfq: 前复权
+
+universe:
+  min_list_days: 120
+  exclude_st: true
+  exclude_suspended: true
+  min_avg_amount_20d: 10000000.0 # 1000万元日均成交额
+  exclude_delisted: true
+
+qa_checks:
+  max_missing_ratio: 0.05
+  check_ohlc_logic: true
+  check_price_positive: true

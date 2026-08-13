@@ -1,0 +1,57 @@
+# Baseline Factor System Configuration (12 Factors)
+winsorize:
+  enabled: true
+  lower_quantile: 0.01
+  upper_quantile: 0.99
+
+standardize:
+  method: "zscore" # zscore / rank / minmax
+
+factors:
+  # Momentum
+  - name: "return_5d"
+    type: "momentum"
+    period: 5
+  - name: "return_20d"
+    type: "momentum"
+    period: 20
+  - name: "return_60d"
+    type: "momentum"
+    period: 60
+
+  # Trend
+  - name: "ma_dist_5_20"
+    type: "trend"
+    short_period: 5
+    long_period: 20
+  - name: "ma_dist_20_60"
+    type: "trend"
+    short_period: 20
+    long_period: 60
+  - name: "dist_high_20d"
+    type: "trend"
+    period: 20
+
+  # Reversal
+  - name: "reversal_1d"
+    type: "reversal"
+    period: 1
+  - name: "reversal_3d"
+    type: "reversal"
+    period: 3
+
+  # Volatility
+  - name: "volatility_20d"
+    type: "volatility"
+    period: 20
+  - name: "atr_ratio_20d"
+    type: "volatility"
+    period: 20
+
+  # Volume / Liquidity
+  - name: "volume_zscore_20d"
+    type: "volume"
+    period: 20
+  - name: "turnover_proxy_20d"
+    type: "liquidity"
+    period: 20

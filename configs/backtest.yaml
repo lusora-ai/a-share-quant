@@ -1,0 +1,24 @@
+# Backtest & Portfolio Configuration
+backtest:
+  initial_capital: 100000.0 # 虚拟研究建仓本金 10万元
+  top_n: 10                  # 研究持仓规则，选前10只
+  weight_scheme: "equal"     # equal: 等权重
+  max_stock_weight: 0.10     # 单只股票权重上限 10%
+  holding_period_days: 5     # 目标持仓天数
+  rebalance_freq: 5          # 每 5 个交易日调仓
+
+costs:
+  commission_rate: 0.00025   # 佣金 万2.5 (单边)
+  stamp_duty_rate: 0.0005    # 印花税 千0.5 (卖出单边)
+  slippage_bps: 5.0          # 模拟买卖滑点 5 个基点 (0.05%)
+  min_commission: 5.0        # 最低佣金 5 元
+
+rules:
+  t_plus_1: true             # T+1 卖出约束
+  check_limit_up: true       # 涨停板不可买入判断
+  check_limit_down: true     # 跌停板不可卖出判断
+  check_suspended: true      # 停牌股票直接处理为无法买卖
+
+real_account_limits:
+  max_cash: 300.0            # 真实小额体验资金 300元
+  lot_size: 100              # 最低交易单位 (1手 = 100股)

@@ -1,0 +1,2 @@
+[console_scripts]
+ashare-quant = ashare_quant.cli:cli
