@@ -67,7 +67,7 @@ class LGBMRankingModel:
             )
             self.use_hgb = False
             logger.info("LightGBM model training completed natively.")
-        except Exception as e:
+        except BaseException as e:
             logger.warning(f"Native LightGBM failed ({e}). Falling back to sklearn HistGradientBoostingRegressor...")
             self.use_hgb = True
             hgb_model = HistGradientBoostingRegressor(

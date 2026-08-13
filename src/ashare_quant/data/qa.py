@@ -8,6 +8,7 @@ logger = setup_logger("ashare_quant.data.qa")
 class DataQAValidator:
     """
     数据质量检查与数据防泄漏校验器
+    对 Raw 价格与 Adj 价格进行独立的逻辑校验
     """
     def __init__(self, check_ohlc: bool = True, check_price_positive: bool = True, max_missing_ratio: float = 0.05):
         self.check_ohlc = check_ohlc
@@ -25,11 +26,13 @@ class DataQAValidator:
             "negative_price_errors": 0,
             "missing_values_filled": 0,
             "is_valid": True,
+            "quality_flag": "OK",
             "errors": []
         }
         
         if df.empty:
             report["is_valid"] = False
+            report["quality_flag"] = "DATA_QUALITY_DEGRADED"
             report["errors"].append("Input DataFrame is empty.")
             return df, report
             
@@ -40,46 +43,59 @@ class DataQAValidator:
         clean_df = clean_df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
         report["duplicates_removed"] = before_dup - len(clean_df)
         
-        # 2. 验证价格正数
+        # 2. 验证价格正数 (检查 open_raw 与 open_adj)
         if self.check_price_positive:
-            for col in ["open", "high", "low", "close"]:
-                if col in clean_df.columns:
-                    invalid_mask = clean_df[col] <= 0
-                    invalid_count = invalid_mask.sum()
-                    if invalid_count > 0:
-                        report["negative_price_errors"] += invalid_count
-                        report["errors"].append(f"Found {invalid_count} non-positive prices in column '{col}'.")
-                        # 过滤掉非法价格行
-                        clean_df = clean_df[~invalid_mask]
-                        
-        # 3. OHLC 逻辑校验: high >= max(open, close) 且 low <= min(open, close)
+            for prefix in ["raw", "adj"]:
+                for col_base in ["open", "high", "low", "close"]:
+                    col = f"{col_base}_{prefix}"
+                    if col in clean_df.columns:
+                        invalid_mask = clean_df[col] <= 0
+                        invalid_count = invalid_mask.sum()
+                        if invalid_count > 0:
+                            report["negative_price_errors"] += invalid_count
+                            report["errors"].append(f"Found {invalid_count} non-positive prices in column '{col}'.")
+                            clean_df = clean_df[~invalid_mask]
+                            
+        prefixes = ["raw", "adj"]
+        if not any(f"open_{p}" in clean_df.columns for p in prefixes) and "open" in clean_df.columns:
+            prefixes = [""]
+
         if self.check_ohlc and not clean_df.empty:
-            max_oc = clean_df[["open", "close"]].max(axis=1)
-            min_oc = clean_df[["open", "close"]].min(axis=1)
+            for prefix in prefixes:
+                p_str = f"_{prefix}" if prefix else ""
+                open_col, high_col, low_col, close_col = f"open{p_str}", f"high{p_str}", f"low{p_str}", f"close{p_str}"
+                if open_col in clean_df.columns and high_col in clean_df.columns:
+                    max_oc = clean_df[[open_col, close_col]].max(axis=1)
+                    min_oc = clean_df[[open_col, close_col]].min(axis=1)
+                    
+                    high_invalid = clean_df[high_col] < max_oc - 1e-4
+                    low_invalid = clean_df[low_col] > min_oc + 1e-4
+                    
+                    ohlc_invalid_mask = high_invalid | low_invalid
+                    ohlc_invalid_count = ohlc_invalid_mask.sum()
+                    
+                    if ohlc_invalid_count > 0:
+                        report["ohlc_errors_fixed"] += ohlc_invalid_count
+                        logger.warning(f"Fixing {ohlc_invalid_count} rows with invalid OHLC relationship in '{open_col}'.")
+                        clean_df.loc[high_invalid, high_col] = max_oc[high_invalid]
+                        clean_df.loc[low_invalid, low_col] = min_oc[low_invalid]
+                        
+        # 4. 检查涨跌停标记是否降级
+        if "limit_buy" not in clean_df.columns or clean_df["limit_buy"].isna().any():
+            report["quality_flag"] = "DATA_QUALITY_DEGRADED"
+            clean_df["data_quality_flag"] = "DATA_QUALITY_DEGRADED"
+            logger.warning("Limit up/down fields missing or corrupted. Marked DATA_QUALITY_DEGRADED.")
             
-            high_invalid = clean_df["high"] < max_oc - 1e-4
-            low_invalid = clean_df["low"] > min_oc + 1e-4
-            
-            ohlc_invalid_mask = high_invalid | low_invalid
-            ohlc_invalid_count = ohlc_invalid_mask.sum()
-            
-            if ohlc_invalid_count > 0:
-                report["ohlc_errors_fixed"] = ohlc_invalid_count
-                logger.warning(f"Fixing {ohlc_invalid_count} rows with invalid OHLC relationship.")
-                # 修复 OHLC 边界关系
-                clean_df.loc[high_invalid, "high"] = max_oc[high_invalid]
-                clean_df.loc[low_invalid, "low"] = min_oc[low_invalid]
-                
-        # 4. 缺失值比率检查
-        missing_count = clean_df[["open", "high", "low", "close", "volume"]].isna().sum().sum()
-        missing_ratio = missing_count / (len(clean_df) * 5) if len(clean_df) > 0 else 0
+        # 5. 缺失值比率检查
+        missing_cols = [c for c in ["open_raw", "close_raw", "open_adj", "close_adj", "volume"] if c in clean_df.columns]
+        missing_count = clean_df[missing_cols].isna().sum().sum()
+        missing_ratio = missing_count / (len(clean_df) * len(missing_cols)) if len(clean_df) > 0 else 0
         if missing_ratio > self.max_missing_ratio:
             report["is_valid"] = False
+            report["quality_flag"] = "DATA_QUALITY_DEGRADED"
             report["errors"].append(f"Missing ratio {missing_ratio:.2%} exceeds max threshold {self.max_missing_ratio:.2%}.")
             
-        # 5. 最终按 ts_code 与 trade_date 排序
         clean_df = clean_df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
         report["total_rows_output"] = len(clean_df)
         
-        logger.info(f"QA Validation Completed. Input: {report['total_rows_input']} | Output: {report['total_rows_output']} | Valid: {report['is_valid']}")
         return clean_df, report
