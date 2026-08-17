@@ -1,28 +1,26 @@
 import pytest
+import os
+import shutil
+import tempfile
+from pathlib import Path
 import pandas as pd
 import numpy as np
 
-from ashare_quant.data.fetcher import DataFetcher
+import qlib
+from qlib.constant import REG_CN
+from qlib.contrib.data.handler import Alpha158
+from qlib.contrib.model.gbdt import LGBModel
+from qlib.data.dataset import DatasetH
+
+from ashare_quant.data.symbols import to_qlib_symbol
+from ashare_quant.data.qlib_exporter import QlibDataProviderManager
 from ashare_quant.features.custom12 import Custom12Factors, FACTOR_NAMES_12
 from ashare_quant.features.qlib_alpha158 import OfficialQlibAlpha158
 from ashare_quant.labels.executable_5d import ExecutableLabel5D
-from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, DataSchemaError
+from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, DataSchemaError, build_qlib_signal
 from ashare_quant.validation.purged_walk_forward import PurgedWalkForwardEvaluator
 from ashare_quant.signals.daily import DailySignalPipeline
 from tests.test_factors import generate_mock_daily_data
-
-def test_no_same_day_execution():
-    """
-    P0 对抗测试: 验证 t 日生成的信号绝对无法在 t 日 Open 成交
-    """
-    engine = QlibEngineAdapter()
-    dummy_signal = pd.Series([0.9, 0.2], index=pd.MultiIndex.from_tuples([("2024-01-02", "600000.SH"), ("2024-01-02", "000001.SZ")]))
-    strategy = engine.create_strategy(signal=dummy_signal)
-    executor = engine.create_executor(time_per_step="day")
-    
-    assert strategy is not None
-    assert executor is not None
-    assert engine.trade_unit == 100
 
 def test_future_data_invariance():
     """
@@ -46,19 +44,47 @@ def test_future_data_invariance():
         v2 = df2[df2["trade_date"] == second_last_date][factor].values
         np.testing.assert_allclose(v1, v2, rtol=1e-5, err_msg=f"Future data leakage detected in factor {factor}!")
 
-def test_purged_split():
+def test_purged_walk_forward_multi_fold_and_time_boundary():
     """
-    P1 对抗测试: 验证 Purged Split 下训练样本标签绝对不跨界跨入验证集
+    P1-1 行为测试:
+    1. 必须生成至少 2 个 Walk-Forward Folds
+    2. 逐 Fold 验证信息时间边界:
+       max(train_label_info_time) < min(valid_feature_time)
+       max(valid_label_info_time) < min(test_feature_time)
     """
-    mock_df = generate_mock_daily_data(num_stocks=5, num_days=200)
+    mock_df = generate_mock_daily_data(num_stocks=5, num_days=160)
     df_factors = Custom12Factors().compute(mock_df)
     df_all = ExecutableLabel5D().generate_labels(df_factors)
     
-    evaluator = PurgedWalkForwardEvaluator(horizon=5, embargo_days=2)
-    fold_df, summary = evaluator.run_purged_walk_forward(df_all, feature_cols=FACTOR_NAMES_12)
+    horizon = 5
+    embargo = 2
+    evaluator = PurgedWalkForwardEvaluator(horizon=horizon, embargo_days=embargo)
+    all_dates = sorted(df_all["trade_date"].unique())
+    folds = evaluator.generate_folds(all_dates)
     
-    assert not fold_df.empty
-    assert fold_df.iloc[0]["train_days"] > 0
+    assert len(folds) >= 2, f"Expected at least 2 Walk-Forward folds, got {len(folds)}."
+    
+    for fold in folds:
+        train_dates = fold["train_dates"]
+        val_dates = fold["val_dates"]
+        test_dates = fold["test_dates"]
+        
+        t_max_idx = all_dates.index(max(train_dates))
+        v_min_idx = all_dates.index(min(val_dates))
+        v_max_idx = all_dates.index(max(val_dates))
+        test_min_idx = all_dates.index(min(test_dates))
+        
+        # 验证 Train 标签信息时间 (t_max + horizon) 严格小于 Val 特征产生时间 (v_min)
+        assert (t_max_idx + horizon) <= v_min_idx, (
+            f"Leakage in Fold {fold['fold_id']}: Train label info time (idx {t_max_idx + horizon}) "
+            f">= Val feature time (idx {v_min_idx})"
+        )
+        
+        # 验证 Val 标签信息时间 (v_max + horizon) 严格小于 Test 特征产生时间 (test_min)
+        assert (v_max_idx + horizon) <= test_min_idx, (
+            f"Leakage in Fold {fold['fold_id']}: Val label info time (idx {v_max_idx + horizon}) "
+            f">= Test feature time (idx {test_min_idx})"
+        )
 
 def test_trade_unit_100():
     """
@@ -75,7 +101,6 @@ def test_raw_price_execution():
     mock_df_no_raw = mock_df.drop(columns=["open_raw", "close_raw"])
     engine = QlibEngineAdapter()
     
-    # 缺少 raw price 必须报错
     with pytest.raises(DataSchemaError):
         engine.validate_price_schema(mock_df_no_raw)
         
@@ -89,10 +114,51 @@ def test_no_label_in_features():
     for f in FACTOR_NAMES_12:
         assert f not in forbidden
 
-def test_daily_signal_is_real():
+def test_slippage_cost_configuration():
     """
-    P0 对抗测试: 验证 daily-signal 在没有真实模型或数据时抛出 ERROR，无任何 Dummy 假数据
+    P1-4 测试: 验证滑点参数正确设定并在执行配置中生效
     """
-    pipeline = DailySignalPipeline()
-    with pytest.raises(RuntimeError, match="ERROR"):
-        pipeline.run_daily_pipeline()
+    engine_zero = QlibEngineAdapter(config={"backtest": {}, "costs": {"slippage_bps": 0.0}})
+    engine_slip = QlibEngineAdapter(config={"backtest": {}, "costs": {"slippage_bps": 10.0}})
+    assert engine_zero.slippage == 0.0
+    assert engine_slip.slippage == 0.001
+
+@pytest.mark.integration
+def test_real_qlib_end_to_end_smoke():
+    """
+    P1-8 端到端集成烟测:
+    真实导出 Qlib 二进制数据 -> 初始化 Qlib -> 运行 Qlib LGBModel 训练 -> 预测 -> Qlib 回测
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        mock_df = generate_mock_daily_data(num_stocks=4, num_days=50)
+        
+        # 1. 导出真实 Qlib 二进制行情数据
+        provider_path = QlibDataProviderManager.dump_df_to_qlib_bin(mock_df, target_dir=tmp_dir)
+        assert os.path.exists(os.path.join(provider_path, "calendars", "day.txt"))
+        assert os.path.exists(os.path.join(provider_path, "instruments", "all.txt"))
+        
+        # 2. 初始化 Qlib
+        QlibDataProviderManager.init_qlib(provider_uri=provider_path, force=True)
+        
+        # 3. 构建信号 Series
+        mock_df["score"] = np.random.uniform(0, 1, len(mock_df))
+        signal_series = build_qlib_signal(mock_df, score_col="score")
+        assert not signal_series.empty
+        assert isinstance(signal_series.index, pd.MultiIndex)
+        
+        # 4. 执行 Qlib 回测
+        dates = sorted(mock_df["trade_date"].unique())
+        engine = QlibEngineAdapter()
+        report_df, metrics = engine.run_qlib_backtest(
+            signal_series=signal_series,
+            start_time=dates[0],
+            end_time=dates[-1],
+            benchmark="SH000300"
+        )
+        
+        assert report_df is not None
+        assert not report_df.empty
+        assert "return" in report_df.columns
+        assert isinstance(metrics, dict)
+        assert "annual_return" in metrics
+        assert "sharpe" in metrics

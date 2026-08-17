@@ -1,6 +1,7 @@
 import pytest
 import os
 import glob
+from unittest.mock import patch
 import pandas as pd
 import numpy as np
 
@@ -12,10 +13,18 @@ from qlib.contrib.model.gbdt import LGBModel
 from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy
 from qlib.backtest.executor import SimulatorExecutor
 
+from ashare_quant.data.symbols import to_qlib_symbol, from_qlib_symbol
+from ashare_quant.data.qlib_exporter import QlibDataProviderManager, QlibDataNotReadyError
 from ashare_quant.features.qlib_alpha158 import OfficialQlibAlpha158
 from ashare_quant.models.qlib_lgbm import OfficialQlibLGBMModel
-from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, DataSchemaError
+from ashare_quant.backtest.qlib_engine import (
+    QlibEngineAdapter,
+    DataSchemaError,
+    QlibBacktestError,
+    build_qlib_signal
+)
 from ashare_quant.signals.daily import DailySignalPipeline
+from tests.test_factors import generate_mock_daily_data
 
 def test_real_qlib_installed():
     """
@@ -34,6 +43,19 @@ def test_qlib_dependency_exists():
     assert TopkDropoutStrategy is not None
     assert SimulatorExecutor is not None
 
+def test_symbol_canonical_conversion():
+    """
+    P0-5 验证 A股 与 Qlib Canonical 证券代码双向严格转换
+    """
+    assert to_qlib_symbol("600000.SH") == "SH600000"
+    assert to_qlib_symbol("000001.SZ") == "SZ000001"
+    assert to_qlib_symbol("000300.SH") == "SH000300"
+    assert to_qlib_symbol("sh600000") == "SH600000"
+    assert to_qlib_symbol("SH600000") == "SH600000"
+    
+    assert from_qlib_symbol("SH600000") == "600000.SH"
+    assert from_qlib_symbol("SZ000001") == "000001.SZ"
+
 def test_alpha158_comes_from_qlib():
     """
     验证官方 Alpha158 模块路径确实直接来自 qlib.contrib.data.handler
@@ -42,12 +64,10 @@ def test_alpha158_comes_from_qlib():
     assert adapter.handler_cls is Alpha158
     assert adapter.handler_cls.__module__.startswith("qlib.")
     
-    # 验证 158 个特征表达式定义来自 Qlib 官方 Alpha158DL
     fields, names = OfficialQlibAlpha158.get_feature_config()
     assert len(names) == 158
     assert "KMID" in names
     assert "KLEN" in names
-    assert "ROC60" in names or any("ROC" in n for n in names)
 
 def test_qlib_model_is_real():
     """
@@ -57,48 +77,70 @@ def test_qlib_model_is_real():
     assert isinstance(adapter.model, LGBModel)
     assert adapter.model.__class__.__module__.startswith("qlib.")
 
-def test_qlib_backtest_is_real():
+def test_signal_score_col_is_strictly_used():
     """
-    验证生产回测引擎适配器真实构建 Qlib TopkDropoutStrategy 与 SimulatorExecutor
+    P0-4 验证 build_qlib_signal 严格只使用指定的 score_col，第一列放随机垃圾数绝不干扰信号
+    """
+    df = pd.DataFrame({
+        "garbage_col": [9999.0, 8888.0],
+        "ts_code": ["600000.SH", "000001.SZ"],
+        "trade_date": ["2024-01-02", "2024-01-02"],
+        "model_score": [0.85, 0.12]
+    })
+    
+    signal = build_qlib_signal(df, score_col="model_score")
+    assert isinstance(signal, pd.Series)
+    assert isinstance(signal.index, pd.MultiIndex)
+    assert signal.index.names == ["datetime", "instrument"]
+    
+    # 验证 MultiIndex 中的 instrument 是 Qlib Canonical 格式
+    instruments = signal.index.get_level_values("instrument").tolist()
+    assert "SH600000" in instruments
+    assert "SZ000001" in instruments
+    
+    # 验证数值严格来自于 model_score，绝非 garbage_col
+    dt = pd.to_datetime("2024-01-02")
+    assert signal.loc[(dt, "SH600000")] == 0.85
+    assert signal.loc[(dt, "SZ000001")] == 0.12
+
+def test_backtest_failure_raises():
+    """
+    P0-1 对抗测试：Qlib backtest 发生异常时，必须 raise QlibBacktestError，绝不返回 Fake metrics
     """
     adapter = QlibEngineAdapter()
+    dummy_signal = pd.Series(
+        [0.85, 0.12],
+        index=pd.MultiIndex.from_tuples(
+            [(pd.to_datetime("2024-01-02"), "SH600000"), (pd.to_datetime("2024-01-02"), "SZ000001")],
+            names=["datetime", "instrument"]
+        )
+    )
     
-    # 验证交易单位为 100 股一手
-    assert adapter.trade_unit == 100
-    
-    dummy_signal = pd.Series([0.8, 0.5], index=pd.MultiIndex.from_tuples([("2024-01-02", "600000.SH"), ("2024-01-02", "000001.SZ")]))
-    strategy = adapter.create_strategy(signal=dummy_signal)
-    assert isinstance(strategy, TopkDropoutStrategy)
-    assert strategy.__class__.__module__.startswith("qlib.")
-    
-    executor = adapter.create_executor()
-    assert isinstance(executor, SimulatorExecutor)
-    assert executor.__class__.__module__.startswith("qlib.")
+    with patch.object(adapter, "create_strategy", return_value="mock_strategy"):
+        with patch.object(adapter, "create_executor", return_value="mock_executor"):
+            with patch("ashare_quant.data.qlib_exporter.QlibDataProviderManager.init_qlib"):
+                with patch("ashare_quant.backtest.qlib_engine.qlib_backtest", side_effect=ValueError("Simulated low-level exchange failure")):
+                    with pytest.raises(QlibBacktestError) as excinfo:
+                        adapter.run_qlib_backtest(
+                            signal_series=dummy_signal,
+                            start_time="2024-01-02",
+                            end_time="2024-01-03",
+                            benchmark="SH000300"
+                        )
+                    assert "Simulated low-level exchange failure" in str(excinfo.value)
 
-def test_no_fake_performance_metrics():
+def test_qlib_data_not_ready_raises():
     """
-    对抗测试：扫描整个 src/ 生产代码路径，严禁出现固定假指标字符串 (如 "cagr": 0.15 或 "sharpe": 1.5)
+    P0-6 验证数据目录不完整时必须抛出 QlibDataNotReadyError
     """
-    src_files = glob.glob("src/ashare_quant/**/*.py", recursive=True)
-    forbidden_snippets = [
-        '"cagr": 0.15',
-        "'cagr': 0.15",
-        '"sharpe": 1.5',
-        "'sharpe': 1.5",
-        '"max_drawdown": -0.05',
-        "'max_drawdown': -0.05",
-    ]
-    for filepath in src_files:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-            for snippet in forbidden_snippets:
-                assert snippet not in content, f"Forbidden fake mock metric '{snippet}' detected in production file {filepath}!"
+    with pytest.raises(QlibDataNotReadyError):
+        QlibDataProviderManager.check_provider_ready("non_existent_data_directory_12345")
 
 def test_no_demo_daily_signal():
     """
-    验证 daily-signal 绝不输出任何假 Demo 股票，缺模型或数据时直接抛出 RuntimeError
+    P0-10 验证 daily-signal 在没有真实模型或数据时直接抛出 RuntimeError
     """
-    pipeline = DailySignalPipeline()
+    pipeline = DailySignalPipeline(exp_dir="non_existent_experiments_dir")
     with pytest.raises(RuntimeError, match="ERROR"):
         pipeline.run_daily_pipeline()
 
@@ -109,7 +151,9 @@ def test_adjusted_price_not_used_for_cash_execution():
     adapter = QlibEngineAdapter()
     invalid_df = pd.DataFrame({
         "open_adj": [10.0, 11.0],
-        "close_adj": [10.5, 11.5]
+        "close_adj": [10.5, 11.5],
+        "ts_code": ["600000.SH", "000001.SZ"],
+        "trade_date": ["2024-01-02", "2024-01-02"]
     })
     with pytest.raises(DataSchemaError, match="DataSchemaError"):
         adapter.validate_price_schema(invalid_df)

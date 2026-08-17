@@ -27,8 +27,8 @@ class NativeLGBMModel:
         if valid_train.empty:
             raise ValueError(f"Training DataFrame has no valid rows for features and label '{self.label_col}'.")
             
-        X_train = valid_train[cols]
-        y_train = valid_train[self.label_col]
+        X_train = np.ascontiguousarray(valid_train[cols].values, dtype=np.float32)
+        y_train = np.ascontiguousarray(valid_train[self.label_col].values, dtype=np.float32)
         
         logger.info(f"Training Native LightGBM Model on {len(X_train)} samples...")
         
@@ -39,7 +39,7 @@ class NativeLGBMModel:
             subsample=self.model_params.get("subsample", 0.8),
             colsample_bytree=self.model_params.get("colsample_bytree", 0.8),
             random_state=self.model_params.get("random_state", 42),
-            n_estimators=self.model_params.get("n_estimators", 300),
+            n_estimators=self.model_params.get("n_estimators", 100),
             verbosity=-1,
             n_jobs=-1
         )
@@ -49,7 +49,9 @@ class NativeLGBMModel:
         if val_df is not None and not val_df.empty:
             valid_val = val_df.dropna(subset=cols + [self.label_col])
             if len(valid_val) >= 10:
-                eval_set = [(valid_val[cols], valid_val[self.label_col])]
+                X_val = np.ascontiguousarray(valid_val[cols].values, dtype=np.float32)
+                y_val = np.ascontiguousarray(valid_val[self.label_col].values, dtype=np.float32)
+                eval_set = [(X_val, y_val)]
                 callbacks = [lgb.early_stopping(stopping_rounds=30, verbose=False)]
                 
         lgb_model.fit(X_train, y_train, eval_set=eval_set, callbacks=callbacks)

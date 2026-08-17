@@ -52,6 +52,10 @@
 | **Purged Walk-Forward** | `PurgedWalkForwardEvaluator` (严格 5 日 Purge 隔离) | ✅ **PRODUCTION** | De Prado AFML 标准 |
 | **Legacy 简化回测** | `src/ashare_quant/backtest/legacy_backtest.py` | ❌ **PERMANENTLY DISABLED** | 已由 Qlib 官方回测内核全面接管 |
 
+> **说明与约束边界**：
+> 1. **涨跌停限制模式**：当前回测处于 `benchmark_mode: uniform_limit_threshold` (统一以 9.9% 涨跌停逼近 CSI300 主板标的约束)。后续接入全 A 股 PIT 精细化行情数据时将升级为逐股票历史状态表达式 (`limit_buy` / `limit_sell`)。在此之前系统不声称已完整覆盖创业板/科创板 20% 及 ST 5% 的全部复杂动态涨跌停。
+> 2. **基准代码**：统一采用 Qlib Canonical Symbol（如 `SH000300`）。
+
 ---
 
 ## 三、 项目目录结构

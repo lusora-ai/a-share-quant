@@ -1,6 +1,7 @@
 """
 Production Microsoft Qlib Backtest Engine Adapter.
-Directly wraps and executes official qlib.backtest, TopkDropoutStrategy, SimulatorExecutor, and PortAnaRecord.
+Directly executes official qlib.backtest, TopkDropoutStrategy, SimulatorExecutor, and risk_analysis.
+Zero fake metrics, zero mock fallbacks.
 """
 from typing import Dict, Any, Tuple, Optional, Union
 import pandas as pd
@@ -12,8 +13,8 @@ from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy
 from qlib.backtest.executor import SimulatorExecutor
 from qlib.backtest import backtest as qlib_backtest
 from qlib.contrib.evaluate import risk_analysis
-from qlib.workflow.record_temp import PortAnaRecord, SigAnaRecord
 
+from ashare_quant.data.symbols import to_qlib_symbol
 from ashare_quant.data.qlib_exporter import QlibDataProviderManager
 from ashare_quant.utils.logging import setup_logger
 from ashare_quant.utils.config import load_config
@@ -24,20 +25,41 @@ class DataSchemaError(ValueError):
     """Raised when required raw/adjusted price columns are missing."""
     pass
 
+class QlibBacktestError(RuntimeError):
+    """Raised when Qlib backtest execution fails."""
+    pass
+
+def build_qlib_signal(df: pd.DataFrame, score_col: str) -> pd.Series:
+    """
+    将包含 ts_code, trade_date, score_col 的 DataFrame 转换为 Qlib 规范的 MultiIndex Series。
+    MultiIndex: (datetime, instrument)
+    Values: score_col 浮点数值
+    """
+    if score_col not in df.columns:
+        raise ValueError(f"Score column '{score_col}' not found in input DataFrame. Columns: {list(df.columns)}")
+    
+    if "ts_code" not in df.columns or "trade_date" not in df.columns:
+        raise ValueError("Input DataFrame must contain 'ts_code' and 'trade_date' columns.")
+
+    sub = df[["trade_date", "ts_code", score_col]].copy()
+    sub["datetime"] = pd.to_datetime(sub["trade_date"])
+    sub["instrument"] = sub["ts_code"].astype(str).apply(to_qlib_symbol)
+    
+    # 构造标准 MultiIndex (datetime, instrument)
+    signal_series = sub.set_index(["datetime", "instrument"])[score_col].astype(float).sort_index()
+    return signal_series
+
 class QlibEngineAdapter:
     """
     Microsoft Qlib 生产回测内核适配器
     职责：
     1. 构建与校验 Qlib 中国市场交易配置 (trade_unit=100, 佣金万2.5, 印花税千0.5, 滑点5bps)
-    2. 将预测 score 转为 Qlib Signal
+    2. 将指定的 score_col 严格转为 Qlib Canonical Signal (MultiIndex Series)
     3. 调用官方 Qlib Backtest / SimulatorExecutor / TopkDropoutStrategy
-    4. 使用 Qlib PortAnaRecord / risk_analysis 提取真实评估指标与收益曲线
-    5. 严格分离 raw price (实际资金成交) 与 adjusted price (收益计算)，缺失时 Fail Loudly
+    4. 使用 Qlib risk_analysis 提取真实评估指标与收益曲线
+    5. 回测失败立即 raise QlibBacktestError，绝不伪造任何金融指标
     """
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        # 确保 Qlib 处于已初始化状态
-        QlibDataProviderManager.init_qlib()
-        
         self.config = config or load_config("backtest")
         self.bt_cfg = self.config.get("backtest", {})
         self.costs_cfg = self.config.get("costs", {})
@@ -52,16 +74,6 @@ class QlibEngineAdapter:
         self.min_cost = float(self.costs_cfg.get("min_commission", 5.0))
         self.slippage = float(self.costs_cfg.get("slippage_bps", 5.0)) / 10000.0
 
-    def run_backtest(self, df_all: pd.DataFrame, score_col: str = "lgbm_score") -> Tuple[pd.DataFrame, Dict[str, Any]]:
-        """
-        标准回测接口
-        """
-        self.validate_price_schema(df_all)
-        dates = sorted(df_all["trade_date"].unique())
-        start_time = dates[0] if dates else "2024-01-01"
-        end_time = dates[-1] if dates else "2024-01-02"
-        return self.run_qlib_backtest(df_all, start_time=start_time, end_time=end_time)
-
     def validate_price_schema(self, df: pd.DataFrame) -> None:
         """
         验证价格 Schema。严禁将 adjusted price 直接当作真实成交价。
@@ -73,9 +85,10 @@ class QlibEngineAdapter:
                 "Raw prices are strictly required for cash accounting and 100-share trading units."
             )
 
-    def create_strategy(self, signal: Union[pd.Series, pd.DataFrame], **kwargs) -> TopkDropoutStrategy:
+    def create_strategy(self, signal: pd.Series, **kwargs) -> TopkDropoutStrategy:
         """
         构建 Qlib 官方 TopkDropoutStrategy 选股换仓策略
+        入参必须为经过 build_qlib_signal 处理的 MultiIndex Series
         """
         logger.info(f"Creating Qlib TopkDropoutStrategy (topk={self.top_k}, n_drop={self.n_drop})...")
         strategy = TopkDropoutStrategy(
@@ -97,30 +110,52 @@ class QlibEngineAdapter:
         )
         return executor
 
+    def run_backtest(self, df_all: pd.DataFrame, score_col: str = "lgbm_score", benchmark: str = "SH000300") -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        执行标准回测接口
+        """
+        self.validate_price_schema(df_all)
+        signal_series = build_qlib_signal(df_all, score_col=score_col)
+        
+        dates = sorted(pd.to_datetime(df_all["trade_date"]).dt.strftime("%Y-%m-%d").unique())
+        start_time = dates[0]
+        end_time = dates[-1]
+        
+        return self.run_qlib_backtest(
+            signal_series=signal_series,
+            start_time=start_time,
+            end_time=end_time,
+            benchmark=to_qlib_symbol(benchmark)
+        )
+
     def run_qlib_backtest(
         self,
-        signal_df: pd.DataFrame,
+        signal_series: pd.Series,
         start_time: str,
         end_time: str,
-        benchmark: Optional[str] = None
+        benchmark: str = "SH000300"
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
         执行真实 Qlib 回测流程
         """
         logger.info(f"Running official Qlib backtest from {start_time} to {end_time} on benchmark {benchmark}...")
         
+        # 确保 Qlib 已经初始化
+        QlibDataProviderManager.init_qlib()
+
         # 准备 Qlib 回测配置
         exchange_kwargs = {
             "freq": "day",
-            "limit_threshold": 0.099,
+            "limit_threshold": 0.099, # CSI300 standard limit
             "deal_price": "open",
             "open_cost": self.open_cost,
             "close_cost": self.close_cost,
             "min_cost": self.min_cost,
             "trade_unit": self.trade_unit,
+            "impact_cost": self.slippage,
         }
         
-        strategy = self.create_strategy(signal=signal_df)
+        strategy = self.create_strategy(signal=signal_series)
         executor = self.create_executor(time_per_step="day", generate_portfolio_metrics=True)
         
         try:
@@ -129,34 +164,40 @@ class QlibEngineAdapter:
                 end_time=end_time,
                 strategy=strategy,
                 executor=executor,
-                benchmark=benchmark,
+                benchmark=to_qlib_symbol(benchmark),
                 account=self.initial_capital,
                 exchange_kwargs=exchange_kwargs
             )
             
-            report_df = portfolio_metric_dict.get("1day", pd.DataFrame())
+            # P0-2: 正确解包 portfolio_metric_dict["1day"] -> Tuple[pd.DataFrame, dict]
+            metric_res = portfolio_metric_dict.get("1day")
+            if isinstance(metric_res, tuple):
+                report_df, positions = metric_res
+            else:
+                report_df = metric_res
+                
+            if report_df is None or report_df.empty:
+                raise QlibBacktestError("Qlib backtest returned empty portfolio metrics DataFrame.")
+
+            # P0-3: 正确调用与解析 risk_analysis
             bench_col = "bench" if "bench" in report_df.columns else None
             ret_series = report_df["return"] - report_df[bench_col] if bench_col else report_df["return"]
-            analysis_res = risk_analysis(ret_series) if not report_df.empty else {}
+            analysis_res = risk_analysis(ret_series)
+            
+            # 从 DataFrame 中按行列索引解析风险与收益统计
+            annual_ret = float(analysis_res.loc["annualized_return", "risk"]) if "annualized_return" in analysis_res.index else 0.0
+            sharpe = float(analysis_res.loc["information_ratio", "risk"]) if "information_ratio" in analysis_res.index else 0.0
+            max_dd = float(analysis_res.loc["max_drawdown", "risk"]) if "max_drawdown" in analysis_res.index else 0.0
+            bench_ret = float(report_df[bench_col].mean() * 252) if bench_col else 0.0
             
             metrics = {
-                "annual_return": float(analysis_res.get("annualized_return", 0.0)),
-                "benchmark_return": float(report_df[bench_col].mean() * 252) if bench_col else 0.0,
-                "excess_return": float(analysis_res.get("annualized_return", 0.0)),
-                "sharpe": float(analysis_res.get("information_ratio", 0.0)),
-                "max_drawdown": float(analysis_res.get("max_drawdown", 0.0)),
+                "annual_return": annual_ret,
+                "benchmark_return": bench_ret,
+                "excess_return": annual_ret,
+                "sharpe": sharpe,
+                "max_drawdown": max_dd,
             }
             return report_df, metrics
         except Exception as e:
-            logger.warning(f"Qlib backtest full portfolio simulation returned: {e}. Generating execution record...")
-            # 基础模拟指标 fallback 保持回测接口稳定
-            dummy_dates = pd.date_range(start_time, end_time, freq="B").strftime("%Y-%m-%d")
-            report_df = pd.DataFrame({"trade_date": dummy_dates, "return": 0.0005, "total_equity": self.initial_capital, "norm_equity": 1.0})
-            metrics = {
-                "annual_return": 0.126,
-                "benchmark_return": 0.05,
-                "excess_return": 0.076,
-                "sharpe": 1.25,
-                "max_drawdown": -0.045
-            }
-            return report_df, metrics
+            logger.error(f"FATAL: Qlib backtest execution failed: {e}")
+            raise QlibBacktestError(f"Qlib backtest failed: {e}") from e
