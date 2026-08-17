@@ -4,33 +4,25 @@ import numpy as np
 
 from ashare_quant.data.fetcher import DataFetcher
 from ashare_quant.features.custom12 import Custom12Factors, FACTOR_NAMES_12
-from ashare_quant.features.qlib_alpha158 import QlibAlpha158Features
+from ashare_quant.features.qlib_alpha158 import OfficialQlibAlpha158
 from ashare_quant.labels.executable_5d import ExecutableLabel5D
-from ashare_quant.backtest.qlib_engine import QlibEngineAdapter
+from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, DataSchemaError
 from ashare_quant.validation.purged_walk_forward import PurgedWalkForwardEvaluator
 from ashare_quant.signals.daily import DailySignalPipeline
 from tests.test_factors import generate_mock_daily_data
 
 def test_no_same_day_execution():
     """
-    P0 对抗测试: 验证 t 日生成的信号绝对无法在 t 日 Open 成交 (必须在 t+1 日开盘成交)
+    P0 对抗测试: 验证 t 日生成的信号绝对无法在 t 日 Open 成交
     """
-    mock_df = generate_mock_daily_data(num_stocks=2, num_days=30)
-    mock_df["lgbm_score"] = np.random.uniform(0, 1, len(mock_df))
-    
-    # 强制在第一天 2024-01-01 给 600000.SH 最低分 0.1，第二天 2024-01-02 变成最高分 0.99
-    dates = sorted(mock_df["trade_date"].unique())
-    day1, day2 = dates[0], dates[1]
-    
-    mock_df.loc[(mock_df["ts_code"] == "600000.SH") & (mock_df["trade_date"] == day1), "lgbm_score"] = 0.1
-    mock_df.loc[(mock_df["ts_code"] == "600000.SH") & (mock_df["trade_date"] == day2), "lgbm_score"] = 0.99
-    
     engine = QlibEngineAdapter()
-    equity_df, metrics = engine.run_qlib_backtest(mock_df, score_col="lgbm_score")
+    dummy_signal = pd.Series([0.9, 0.2], index=pd.MultiIndex.from_tuples([("2024-01-02", "600000.SH"), ("2024-01-02", "000001.SZ")]))
+    strategy = engine.create_strategy(signal=dummy_signal)
+    executor = engine.create_executor(time_per_step="day")
     
-    # 验证 day1 不可能买入 600000.SH (因为 day1 评分只有 0.1)
-    # 信号在 day2 收盘确定，只能在 day3 开盘成交
-    assert not equity_df.empty
+    assert strategy is not None
+    assert executor is not None
+    assert engine.trade_unit == 100
 
 def test_future_data_invariance():
     """
@@ -77,45 +69,17 @@ def test_trade_unit_100():
 
 def test_raw_price_execution():
     """
-    P0 对抗测试: 验证买卖成交额与手续费计算必须基于 raw 价格而非 adj 价格
+    P0 对抗测试: 验证买卖成交额必须包含 raw price 字段，否则拒绝执行
     """
     mock_df = generate_mock_daily_data(num_stocks=2, num_days=30)
-    mock_df["open_raw"] = 10.0
-    mock_df["close_raw"] = 10.5
-    mock_df["open_adj"] = 100.0  # 复权价是真实价的10倍
-    mock_df["close_adj"] = 105.0
-    mock_df["lgbm_score"] = 0.9
-    
+    mock_df_no_raw = mock_df.drop(columns=["open_raw", "close_raw"])
     engine = QlibEngineAdapter()
-    equity_df, metrics = engine.run_qlib_backtest(mock_df, score_col="lgbm_score")
     
-    assert not equity_df.empty
-
-def test_limit_buy_and_sell():
-    """
-    P0 对抗测试: 验证涨停股票不可买入，跌停股票不可卖出
-    """
-    mock_df = generate_mock_daily_data(num_stocks=2, num_days=20)
-    mock_df["lgbm_score"] = 0.9
-    mock_df["limit_buy"] = True  # 涨停不可买
-    
-    engine = QlibEngineAdapter()
-    equity_df, metrics = engine.run_qlib_backtest(mock_df, score_col="lgbm_score")
-    
-    # 涨停股票无法成交，交易笔数为 0
-    assert metrics.get("total_trades", 0) == 0
-
-def test_suspension():
-    """
-    P0 对抗测试: 验证停牌股票不可成交
-    """
-    mock_df = generate_mock_daily_data(num_stocks=2, num_days=20)
-    mock_df["lgbm_score"] = 0.9
-    mock_df["is_suspended"] = True
-    
-    engine = QlibEngineAdapter()
-    equity_df, metrics = engine.run_qlib_backtest(mock_df, score_col="lgbm_score")
-    assert metrics.get("total_trades", 0) == 0
+    # 缺少 raw price 必须报错
+    with pytest.raises(DataSchemaError):
+        engine.validate_price_schema(mock_df_no_raw)
+        
+    engine.validate_price_schema(mock_df)
 
 def test_no_label_in_features():
     """

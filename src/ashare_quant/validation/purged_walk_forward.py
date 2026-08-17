@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
-from ashare_quant.models.qlib_lgbm import QlibLGBMModelAdapter
+from ashare_quant.models.native_lgbm import NativeLGBMModel
+from ashare_quant.models.sklearn_hgb import SklearnHGBModel
 from ashare_quant.models.metrics import compute_daily_ic, compute_ic_stats
 from ashare_quant.utils.logging import setup_logger
 from ashare_quant.utils.config import load_config
@@ -60,8 +61,8 @@ class PurgedWalkForwardEvaluator:
         val_df = df[df["trade_date"].isin(purged_val_dates)]
         test_df = df[df["trade_date"].isin(test_dates)].copy()
         
-        # 训练 Qlib 模型
-        model = QlibLGBMModelAdapter(feature_cols=feature_cols)
+        # 训练基准模型
+        model = SklearnHGBModel(feature_cols=feature_cols)
         model.fit(train_df, val_df)
         
         # 测试集单次预测

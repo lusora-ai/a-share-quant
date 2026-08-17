@@ -1,6 +1,6 @@
 # LightGBM Model & Walk-Forward Configuration
 model:
-  type: "sklearn_hgb"  # "sklearn_hgb" (Recommended for Windows) or "lightgbm"
+  type: "qlib_lgbm"  # Official Microsoft Qlib LGBModel
   objective: "regression" # regression to rank_label
   metric: "rmse"
   boosting_type: "gbdt"
