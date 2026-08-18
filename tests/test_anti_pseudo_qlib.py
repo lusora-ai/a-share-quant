@@ -21,6 +21,8 @@ from ashare_quant.backtest.qlib_engine import (
     QlibEngineAdapter,
     DataSchemaError,
     QlibBacktestError,
+    BenchmarkDataMissingError,
+    OOSArtifactMissingError as BacktestOOSMissingError,
     build_qlib_signal
 )
 from ashare_quant.signals.daily import DailySignalPipeline
@@ -52,7 +54,7 @@ def test_symbol_canonical_conversion():
     assert to_qlib_symbol("000300.SH") == "SH000300"
     assert to_qlib_symbol("sh600000") == "SH600000"
     assert to_qlib_symbol("SH600000") == "SH600000"
-    
+
     assert from_qlib_symbol("SH600000") == "600000.SH"
     assert from_qlib_symbol("SZ000001") == "000001.SZ"
 
@@ -63,7 +65,7 @@ def test_alpha158_comes_from_qlib():
     adapter = OfficialQlibAlpha158()
     assert adapter.handler_cls is Alpha158
     assert adapter.handler_cls.__module__.startswith("qlib.")
-    
+
     fields, names = OfficialQlibAlpha158.get_feature_config()
     assert len(names) == 158
     assert "KMID" in names
@@ -87,17 +89,17 @@ def test_signal_score_col_is_strictly_used():
         "trade_date": ["2024-01-02", "2024-01-02"],
         "model_score": [0.85, 0.12]
     })
-    
+
     signal = build_qlib_signal(df, score_col="model_score")
     assert isinstance(signal, pd.Series)
     assert isinstance(signal.index, pd.MultiIndex)
     assert signal.index.names == ["datetime", "instrument"]
-    
+
     # 验证 MultiIndex 中的 instrument 是 Qlib Canonical 格式
     instruments = signal.index.get_level_values("instrument").tolist()
     assert "SH600000" in instruments
     assert "SZ000001" in instruments
-    
+
     # 验证数值严格来自于 model_score，绝非 garbage_col
     dt = pd.to_datetime("2024-01-02")
     assert signal.loc[(dt, "SH600000")] == 0.85
@@ -115,7 +117,7 @@ def test_backtest_failure_raises():
             names=["datetime", "instrument"]
         )
     )
-    
+
     with patch.object(adapter, "create_strategy", return_value="mock_strategy"):
         with patch.object(adapter, "create_executor", return_value="mock_executor"):
             with patch("ashare_quant.data.qlib_exporter.QlibDataProviderManager.init_qlib"):

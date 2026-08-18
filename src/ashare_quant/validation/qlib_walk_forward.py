@@ -2,6 +2,12 @@
 Official Qlib Walk-Forward Cross-Validation Engine.
 Executes multi-fold purged rolling evaluation using Qlib Alpha158 Handler, DatasetH, and LGBModel.
 Zero mock data, zero leakage.
+
+Walk-forward parameters (train_years / val_years / test_years / embargo_days) are read
+from cfg["walk_forward"] unless explicitly overridden by the caller — the CLI, the
+evaluator and the experiment metadata must use identical values.
+Production NEVER silently generates reduced folds for short data: insufficient history
+raises InsufficientWalkForwardHistoryError.
 """
 import os
 from typing import List, Dict, Any, Tuple, Optional
@@ -16,7 +22,11 @@ from qlib.contrib.model.gbdt import LGBModel
 from ashare_quant.data.symbols import from_qlib_symbol
 from ashare_quant.models.metrics import compute_daily_ic, compute_ic_stats
 from ashare_quant.models.qlib_lgbm import OfficialQlibLGBMModel
-from ashare_quant.validation.purged_walk_forward import LeakageBoundaryError
+from ashare_quant.validation.purged_walk_forward import (
+    LeakageBoundaryError,
+    InsufficientWalkForwardHistoryError,
+    resolve_walk_forward_config,
+)
 from ashare_quant.utils.logging import setup_logger
 from ashare_quant.utils.config import load_config
 
@@ -29,22 +39,40 @@ class QlibWalkForwardEvaluator:
     def __init__(
         self,
         horizon: int = 5,
-        embargo_days: int = 2,
-        train_years: int = 2,
-        val_years: int = 1,
-        test_years: int = 1,
+        embargo_days: Optional[int] = None,
+        train_years: Optional[int] = None,
+        val_years: Optional[int] = None,
+        test_years: Optional[int] = None,
         config: Optional[Dict[str, Any]] = None
     ):
-        self.horizon = horizon
-        self.embargo_days = embargo_days
-        self.train_years = train_years
-        self.val_years = val_years
-        self.test_years = test_years
         self.config = config or load_config("model_lgbm")
+        resolved = resolve_walk_forward_config(
+            self.config, train_years, val_years, test_years, embargo_days
+        )
+        self.horizon = horizon
+        self.embargo_days = resolved["embargo_days"]
+        self.train_years = resolved["train_years"]
+        self.val_years = resolved["val_years"]
+        self.test_years = resolved["test_years"]
+
+    def walk_forward_config(self) -> Dict[str, Any]:
+        """
+        返回当前 evaluator 实际使用的 walk-forward 参数（CLI / metadata 使用完全一致的值）
+        """
+        return {
+            "train_years": self.train_years,
+            "val_years": self.val_years,
+            "test_years": self.test_years,
+            "embargo_days": self.embargo_days,
+            "horizon": self.horizon,
+        }
 
     def generate_qlib_folds(self, calendar_dates: List[str]) -> List[Dict[str, Any]]:
         """
-        生成严格的 Multi-Fold Walk-Forward 时间切片
+        生成严格的 Multi-Fold Walk-Forward 时间切片。
+
+        正式研究数据不足时直接抛出 InsufficientWalkForwardHistoryError，
+        绝不自动生成缩小版 Fold 改变实验定义。
         """
         all_dt = pd.to_datetime(calendar_dates)
         years = sorted(all_dt.year.unique())
@@ -79,31 +107,14 @@ class QlibWalkForwardEvaluator:
                         "test_raw_dates": purged_test,
                     })
 
-        # 短周期 / 测试数据支持
-        if not folds and len(calendar_dates) >= 40:
-            usable = calendar_dates
-            n = len(usable)
-            step = max(5, n // 6)
-            for f_idx, start_idx in enumerate([0, step]):
-                sub_dates = usable[start_idx : start_idx + int(n * 0.75)]
-                m = len(sub_dates)
-                t_end = int(m * 0.6)
-                v_end = int(m * 0.8)
-
-                purged_train = sub_dates[: max(1, t_end - self.horizon)]
-                purged_val = sub_dates[min(t_end + self.embargo_days, m - 1) : max(t_end + self.embargo_days + 1, v_end - self.horizon)]
-                purged_test = sub_dates[min(v_end + self.embargo_days, m - 1) :]
-
-                if purged_train and purged_val and purged_test:
-                    folds.append({
-                        "fold_id": f_idx + 1,
-                        "train_dates": (purged_train[0], purged_train[-1]),
-                        "val_dates": (purged_val[0], purged_val[-1]),
-                        "test_dates": (purged_test[0], purged_test[-1]),
-                        "train_raw_dates": purged_train,
-                        "val_raw_dates": purged_val,
-                        "test_raw_dates": purged_test,
-                    })
+        if not folds:
+            raise InsufficientWalkForwardHistoryError(
+                f"Insufficient history for Qlib Walk-Forward: calendar has {len(years)} year(s) "
+                f"({years[0] if years else 'n/a'}..{years[-1] if years else 'n/a'}, {len(calendar_dates)} dates), "
+                f"but the configured experiment requires train_years={self.train_years} + "
+                f"val_years={self.val_years} + test_years={self.test_years} "
+                f"(= {total_span} consecutive years). Refusing to degrade the experiment definition."
+            )
 
         return folds
 
@@ -120,10 +131,9 @@ class QlibWalkForwardEvaluator:
         os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
 
         folds = self.generate_qlib_folds(calendar_dates)
-        if not folds:
-            raise ValueError("Insufficient date span to generate Qlib purged walk forward folds.")
 
         logger.info(f"Generated {len(folds)} Qlib Purged Walk-Forward folds.")
+        logger.info(f"Walk-Forward config: {self.walk_forward_config()}")
 
         fold_records = []
         all_oos_preds = []
@@ -186,7 +196,7 @@ class QlibWalkForwardEvaluator:
                 lbl_series = test_labels.values
             else:
                 lbl_series = np.zeros(len(pred_df))
-                
+
             pred_df["label"] = lbl_series
             pred_df["fold_id"] = f_id
             pred_df["train_end_date"] = train_end
@@ -225,7 +235,7 @@ class QlibWalkForwardEvaluator:
 
         fold_df = pd.DataFrame(fold_records)
         oos_predictions_df = pd.concat(all_oos_preds, ignore_index=True)
-        
+
         overall_ic = compute_daily_ic(oos_predictions_df, score_col="score", label_col="label")
         summary = compute_ic_stats(overall_ic)
         summary["num_folds"] = len(folds)

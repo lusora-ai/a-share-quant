@@ -1,7 +1,7 @@
 """
 Production Daily Signal Pipeline.
 Executes real end-to-end scoring, ranking, and candidate generation with Universe tradability filters.
-Zero dummy data, zero silent date fallbacks.
+Zero dummy data, zero silent date fallbacks, zero fake close=0.0.
 """
 import os
 import json
@@ -12,11 +12,11 @@ import pandas as pd
 import numpy as np
 
 from ashare_quant.data.processor import DataProcessor
-from ashare_quant.data.symbols import from_qlib_symbol
+from ashare_quant.data.symbols import from_qlib_symbol, to_qlib_symbol
 from ashare_quant.data.qlib_exporter import QlibDataProviderManager
 from ashare_quant.features.custom12 import Custom12Factors, FACTOR_NAMES_12
 from ashare_quant.features.qlib_alpha158 import OfficialQlibAlpha158
-from ashare_quant.universe.filter import UniverseFilter
+from ashare_quant.universe.filter import build_custom12_universe
 from ashare_quant.reports.daily_report import DailyReportGenerator
 from ashare_quant.utils.logging import setup_logger
 
@@ -66,6 +66,67 @@ class DailySignalPipeline:
         logger.info(f"Loaded production model from experiment '{exp_id}' ({model_path.name}).")
         return exp_id, metadata, model
 
+    def _fetch_alpha158_real_close_and_name(
+        self,
+        provider_uri: str,
+        calc_date: str
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        从真实 Qlib provider 读取 calc_date 日期的 $close 价格和证券名称。
+        返回 (close_df, name_df)，close_df 列: [instrument, close]
+        """
+        p = Path(provider_uri)
+        cal_file = p / "calendars" / "day.txt"
+        calendar_dates = [line.strip() for line in cal_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if calc_date not in calendar_dates:
+            raise ValueError(f"Date '{calc_date}' not found in Qlib calendar.")
+        cal_idx = calendar_dates.index(calc_date)
+
+        # 读取 CSI300 股票清单
+        csi300_file = p / "instruments" / "csi300.txt"
+        instruments = []
+        if csi300_file.exists():
+            for line in csi300_file.read_text(encoding="utf-8").splitlines():
+                parts = line.strip().split()
+                if parts:
+                    instruments.append(parts[0])
+        if not instruments:
+            instruments = [d.name.upper() for d in (p / "features").iterdir() if d.is_dir() and not d.name.startswith("sh000300")]
+
+        records = []
+        for inst in instruments:
+            f_bin = p / "features" / inst.lower() / "close.day.bin"
+            if f_bin.exists():
+                data = np.fromfile(f_bin, dtype="<f")
+                if len(data) > 1:
+                    start_idx = int(data[0])
+                    values = data[1:]
+                    offset = cal_idx - start_idx
+                    if 0 <= offset < len(values):
+                        val = float(values[offset])
+                        if not np.isnan(val) and val > 0:
+                            records.append({"instrument": inst.upper(), "close": round(val, 2)})
+
+        close_df = pd.DataFrame(records) if records else pd.DataFrame(columns=["instrument", "close"])
+
+        # 证券名称：尝试从项目 stock_master 匹配
+        name_df = pd.DataFrame(columns=["instrument", "name"])
+        try:
+            processor = DataProcessor()
+            try:
+                master = processor.storage.load_parquet("stock_master", is_processed=True)
+            finally:
+                processor.close()
+            if master is not None and not master.empty and "ts_code" in master.columns and "name" in master.columns:
+                master = master.copy()
+                master["instrument"] = master["ts_code"].astype(str).apply(to_qlib_symbol)
+                master = master[["instrument", "name"]].drop_duplicates(subset=["instrument"])
+                name_df = master
+        except Exception as e:
+            logger.warning(f"Could not load stock_master for name lookup ({e}); names will fallback to ts_code.")
+
+        return close_df, name_df
+
     def run_daily_pipeline(
         self,
         target_date: Optional[str] = None,
@@ -89,10 +150,10 @@ class DailySignalPipeline:
             # ===== Qlib Alpha158 Pipeline =====
             provider_uri = meta.get("provider_uri") or None
             resolved_uri = QlibDataProviderManager.init_qlib(provider_uri=provider_uri)
-            
+
             cal_file = Path(resolved_uri) / "calendars" / "day.txt"
             calendar_dates = [line.strip() for line in cal_file.read_text(encoding="utf-8").splitlines() if line.strip()]
-            
+
             # P1-3: target_date 禁止 silent fallback
             if target_date is not None:
                 if target_date not in calendar_dates:
@@ -110,12 +171,9 @@ class DailySignalPipeline:
             )
             from qlib.data.dataset import DatasetH
             dataset = DatasetH(handler=handler, segments={"test": (calc_date, calc_date)})
-            
+
             if hasattr(model, "predict"):
-                if hasattr(model, "is_fitted"):
-                    scores_series = model.predict(dataset, segment="test")
-                else:
-                    scores_series = model.predict(dataset, segment="test")
+                scores_series = model.predict(dataset, segment="test")
             else:
                 raise RuntimeError(f"Unknown production model object for Qlib pipeline: {type(model)}")
 
@@ -125,13 +183,20 @@ class DailySignalPipeline:
                 pred_df = pd.DataFrame(scores_series, columns=["score"]).reset_index()
 
             pred_df["ts_code"] = pred_df["instrument"].astype(str).apply(from_qlib_symbol)
-            pred_df["name"] = pred_df["ts_code"]
-            pred_df["close"] = 0.0
+
+            # 获取真实 close 和 name（不许 fake close=0.0）
+            close_df, name_df = self._fetch_alpha158_real_close_and_name(resolved_uri, calc_date)
+            pred_df = pred_df.merge(close_df, on="instrument", how="left")
+            pred_df["close"] = pred_df["close"].fillna(0.0)
+
+            pred_df = pred_df.merge(name_df, on="instrument", how="left")
+            pred_df["name"] = pred_df["name"].fillna(pred_df["ts_code"])
+
             pred_df["industry"] = "CSI300"
             df_scored = pred_df
 
         else:
-            # ===== Custom12 Pipeline =====
+            # ===== Custom12 Pipeline (shared universe) =====
             processor = DataProcessor()
             try:
                 df_master = processor.storage.load_parquet("stock_master", is_processed=True)
@@ -145,7 +210,7 @@ class DailySignalPipeline:
                 processor.close()
 
             available_dates = sorted(df_daily["trade_date"].unique())
-            
+
             # P1-3: target_date 禁止 silent fallback
             if target_date is not None:
                 if target_date not in available_dates:
@@ -154,14 +219,12 @@ class DailySignalPipeline:
             else:
                 calc_date = available_dates[-1]
 
-            # P1-2: 截面 Universe 过滤器 (排除 ST / 停牌 / 上市天数不足 / 流动性不足)
-            u_filter = UniverseFilter()
-            df_universe = u_filter.filter_universe(df_daily, master_df=df_master)
-            df_filtered = df_universe[df_universe["is_in_universe"]].copy()
+            # 共享 universe 过滤 (与 train 严格复用同一函数)
+            df_universe = build_custom12_universe(df_daily, master_df=df_master)
 
             # 计算多因子特征 (与 train 严格复用同一 FeaturePipeline)
             f_engine = Custom12Factors()
-            df_factors = f_engine.compute(df_filtered)
+            df_factors = f_engine.compute(df_universe)
             df_latest = df_factors[df_factors["trade_date"] == calc_date].copy()
             if df_latest.empty:
                 raise RuntimeError(f"ERROR: No factor data available for calculation date '{calc_date}'.")
@@ -183,13 +246,17 @@ class DailySignalPipeline:
 
         candidates = []
         for rank, row in enumerate(top10.to_dict("records"), 1):
+            close_val = float(row.get("close", 0.0))
             candidates.append({
+                "trade_date": calc_date,
                 "rank": rank,
                 "ts_code": row.get("ts_code"),
-                "stock_name": row.get("name", row.get("ts_code")),
+                "name": row.get("name", row.get("ts_code")),
                 "score": float(row.get("score", 0.0)),
                 "industry": row.get("industry", "N/A"),
-                "close": float(row.get("close", 0.0))
+                "close": close_val,
+                "cost_100_shares": round(close_val * 100, 2),
+                "model_id": exp_id,
             })
 
         # 4. 生成每日报告
@@ -211,4 +278,3 @@ class DailySignalPipeline:
         }
         logger.info(f"Real daily signal pipeline completed. {len(candidates)} candidates generated.")
         return res
-

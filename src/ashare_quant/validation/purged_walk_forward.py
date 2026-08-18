@@ -3,6 +3,12 @@ Purged Walk-Forward Cross-Validation Engine.
 Implements multi-fold sliding windows with strict label purging and embargo periods:
   max(label_info_time(Train)) < min(feature_time(Valid))
   max(label_info_time(Valid)) < min(feature_time(Test))
+
+Walk-forward parameters (train_years / val_years / test_years / embargo_days) are read
+from cfg["walk_forward"] unless explicitly overridden by the caller.
+Production NEVER silently generates reduced folds for short data: insufficient history
+raises InsufficientWalkForwardHistoryError. Tests that need short data must construct
+their own folds.
 """
 from typing import List, Dict, Any, Tuple, Optional
 import pandas as pd
@@ -19,6 +25,39 @@ logger = setup_logger("ashare_quant.validation.purged_walk_forward")
 class LeakageBoundaryError(ValueError):
     """Raised when Purge/Embargo boundaries are violated and future label info leaks into next segment."""
     pass
+
+class InsufficientWalkForwardHistoryError(ValueError):
+    """Raised when the available date span cannot support the configured walk-forward folds.
+
+    Production evaluators must NOT degrade the experiment definition (e.g. auto-generating
+    2 shrunken folds) when history is short; they must fail loudly instead.
+    """
+    pass
+
+
+def resolve_walk_forward_config(
+    config: Optional[Dict[str, Any]],
+    train_years: Optional[int],
+    val_years: Optional[int],
+    test_years: Optional[int],
+    embargo_days: Optional[int],
+) -> Dict[str, int]:
+    """
+    统一解析 Walk-Forward 参数：显式入参优先，否则从 cfg["walk_forward"] 读取。
+    CLI / evaluator / metadata 必须使用完全一致的值。
+    """
+    cfg = config or {}
+    wf = cfg.get("walk_forward", {}) or {}
+    resolved = {
+        "train_years": train_years if train_years is not None else int(wf.get("train_years", 4)),
+        "val_years": val_years if val_years is not None else int(wf.get("val_years", 1)),
+        "test_years": test_years if test_years is not None else int(wf.get("test_years", 1)),
+        "embargo_days": embargo_days if embargo_days is not None else int(wf.get("embargo_days", 2)),
+    }
+    if resolved["train_years"] < 1 or resolved["val_years"] < 1 or resolved["test_years"] < 1:
+        raise ValueError(f"Invalid walk_forward parameters: {resolved}")
+    return resolved
+
 
 def create_model_by_type(model_type: str, feature_cols: List[str], config: Optional[Dict[str, Any]] = None):
     """
@@ -41,22 +80,40 @@ class PurgedWalkForwardEvaluator:
     def __init__(
         self,
         horizon: int = 5,
-        embargo_days: int = 2,
-        train_years: int = 4,
-        val_years: int = 1,
-        test_years: int = 1,
+        embargo_days: Optional[int] = None,
+        train_years: Optional[int] = None,
+        val_years: Optional[int] = None,
+        test_years: Optional[int] = None,
         config: Optional[Dict[str, Any]] = None
     ):
-        self.horizon = horizon
-        self.embargo_days = embargo_days
-        self.train_years = train_years
-        self.val_years = val_years
-        self.test_years = test_years
         self.config = config or load_config("model_lgbm")
+        resolved = resolve_walk_forward_config(
+            self.config, train_years, val_years, test_years, embargo_days
+        )
+        self.horizon = horizon
+        self.embargo_days = resolved["embargo_days"]
+        self.train_years = resolved["train_years"]
+        self.val_years = resolved["val_years"]
+        self.test_years = resolved["test_years"]
+
+    def walk_forward_config(self) -> Dict[str, Any]:
+        """
+        返回当前 evaluator 实际使用的 walk-forward 参数（用于 metadata 记录，保持一致性）
+        """
+        return {
+            "train_years": self.train_years,
+            "val_years": self.val_years,
+            "test_years": self.test_years,
+            "embargo_days": self.embargo_days,
+            "horizon": self.horizon,
+        }
 
     def generate_folds(self, all_dates: List[str]) -> List[Dict[str, Any]]:
         """
-        生成严格的 Multi-Fold Walk-Forward 时间切片，并应用 Purge 边界
+        生成严格的 Multi-Fold Walk-Forward 时间切片，并应用 Purge 边界。
+
+        正式研究数据不足时直接抛出 InsufficientWalkForwardHistoryError，
+        绝不自动生成缩小版 Fold 改变实验定义。
         """
         all_dt = pd.to_datetime(all_dates)
         years = sorted(all_dt.year.unique())
@@ -91,33 +148,15 @@ class PurgedWalkForwardEvaluator:
                         "val_years": val_yr,
                         "test_years": test_yr,
                     })
-        
-        # 如果数据不足多年（如短周期或测试数据），按比例生成至少 2 个滚动 Fold
-        if not folds and len(all_dates) >= 40:
-            warmup = 60 if len(all_dates) > 75 else 0
-            usable = all_dates[warmup:]
-            n = len(usable)
-            step = max(5, n // 6)
-            for f_idx, start_idx in enumerate([0, step]):
-                sub_dates = usable[start_idx : start_idx + int(n * 0.75)]
-                m = len(sub_dates)
-                t_end = int(m * 0.6)
-                v_end = int(m * 0.8)
 
-                purged_train = sub_dates[: max(1, t_end - self.horizon)]
-                purged_val = sub_dates[min(t_end + self.embargo_days, m - 1) : max(t_end + self.embargo_days + 1, v_end - self.horizon)]
-                purged_test = sub_dates[min(v_end + self.embargo_days, m - 1) :]
-
-                if purged_train and purged_val and purged_test:
-                    folds.append({
-                        "fold_id": f_idx + 1,
-                        "train_dates": purged_train,
-                        "val_dates": purged_val,
-                        "test_dates": purged_test,
-                        "train_years": [2024],
-                        "val_years": [2024],
-                        "test_years": [2024],
-                    })
+        if not folds:
+            raise InsufficientWalkForwardHistoryError(
+                f"Insufficient history for Purged Walk-Forward: calendar has {len(years)} year(s) "
+                f"({years[0] if years else 'n/a'}..{years[-1] if years else 'n/a'}, {len(all_dates)} dates), "
+                f"but the configured experiment requires train_years={self.train_years} + "
+                f"val_years={self.val_years} + test_years={self.test_years} "
+                f"(= {total_span} consecutive years). Refusing to degrade the experiment definition."
+            )
 
         return folds
 
@@ -133,15 +172,14 @@ class PurgedWalkForwardEvaluator:
         返回: (fold_metrics_df, summary_dict, oos_predictions_df)
         """
         if df_all.empty:
-            return pd.DataFrame(), {}, pd.DataFrame()
+            raise InsufficientWalkForwardHistoryError("Input DataFrame is empty: cannot run walk-forward.")
 
         m_type = model_type or self.config.get("model", {}).get("type", "sklearn_hgb")
         all_dates = sorted(pd.to_datetime(df_all["trade_date"]).dt.strftime("%Y-%m-%d").unique())
         folds = self.generate_folds(all_dates)
-        if not folds:
-            raise ValueError("Insufficient date span to generate purged walk forward folds.")
 
         logger.info(f"Generated {len(folds)} Purged Walk-Forward folds. Model Type: '{m_type}'.")
+        logger.info(f"Walk-Forward config: {self.walk_forward_config()}")
 
         fold_records = []
         all_oos_preds = []
@@ -217,11 +255,10 @@ class PurgedWalkForwardEvaluator:
 
         fold_df = pd.DataFrame(fold_records)
         oos_predictions_df = pd.concat(all_oos_preds, ignore_index=True)
-        
+
         overall_ic = compute_daily_ic(oos_predictions_df, score_col="score", label_col="label")
         summary = compute_ic_stats(overall_ic)
         summary["num_folds"] = len(folds)
         summary["model_type"] = m_type
 
         return fold_df, summary, oos_predictions_df
-

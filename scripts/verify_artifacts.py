@@ -29,11 +29,7 @@ def main():
     meta_path = latest_exp / "metadata.json"
     metrics_path = latest_exp / "metrics.json"
     oos_pred_path = latest_exp / "oos_predictions.parquet"
-    if not oos_pred_path.exists():
-        oos_pred_path = latest_exp / "predictions.parquet"
     model_path = latest_exp / "production_model.joblib"
-    if not model_path.exists():
-        model_path = latest_exp / "model.joblib"
     backtest_report_path = latest_exp / "backtest_report.parquet"
     backtest_metrics_path = latest_exp / "backtest_metrics.json"
 

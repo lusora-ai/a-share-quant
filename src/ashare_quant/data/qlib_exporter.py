@@ -26,14 +26,30 @@ class QlibDataProviderManager:
     严格检查真实 Qlib 数据目录完整性，绝不构造假伪数据
     """
     _initialized = False
+    _initialized_provider_uri: Optional[str] = None
 
     @classmethod
-    def check_provider_ready(cls, provider_uri: str) -> None:
+    def get_initialized_provider_uri(cls) -> Optional[str]:
         """
-        验证 provider_uri 是否具备合法的 Qlib 数据结构：
-        - calendars/day.txt 存在且非空
-        - instruments/all.txt 存在且非空
-        - features/ 目录存在且包含真实数据
+        返回当前已成功初始化的 Qlib provider URI。
+        如果尚未初始化，返回 None。
+        """
+        return cls._initialized_provider_uri
+
+    @classmethod
+    def check_provider_ready(cls, provider_uri: str, mode: str = "csi300") -> None:
+        """
+        验证 provider_uri 是否具备合法的 Qlib 数据结构。
+
+        基础验证（所有模式）:
+          - calendars/day.txt 存在且非空
+          - instruments/all.txt 存在且非空
+          - features/ 目录存在且包含真实数据
+
+        CSI300 模式额外验证:
+          - instruments/csi300.txt 存在且非空
+          - SH000300 benchmark 数据存在（features/sh000300 目录）
+          缺任意核心数据直接 FAIL。
         """
         p = Path(provider_uri).expanduser()
         if not p.exists():
@@ -61,20 +77,42 @@ class QlibDataProviderManager:
                 f"Qlib features directory missing or empty at '{feat_dir}'."
             )
 
+        # CSI300 mode: additional strict checks
+        if mode == "csi300":
+            csi300_file = p / "instruments" / "csi300.txt"
+            if not csi300_file.exists() or csi300_file.stat().st_size == 0:
+                raise QlibDataNotReadyError(
+                    f"CSI300 instrument file missing or empty at '{csi300_file}'. "
+                    f"Alpha158 CSI300 mode requires this file."
+                )
+
+            benchmark_dir = p / "features" / "sh000300"
+            if not benchmark_dir.exists() or not any(benchmark_dir.iterdir()):
+                raise QlibDataNotReadyError(
+                    f"SH000300 benchmark data directory missing or empty at '{benchmark_dir}'. "
+                    f"Benchmark data is required for backtesting."
+                )
+
     @classmethod
     def init_qlib(
         cls,
         provider_uri: Optional[str] = None,
         region: str = REG_CN,
-        force: bool = False
+        force: bool = False,
+        mode: str = "csi300"
     ) -> str:
         """
         初始化 Microsoft Qlib 数据引擎
+
+        成功初始化后保存真正的 provider URI 到 _initialized_provider_uri。
+        如果已经 initialized 且不强制，返回真实已初始化的 provider URI，
+        不会自己猜测 ~/.qlib/...。
         """
         os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
-        
+
         if cls._initialized and not force:
-            return provider_uri or str(Path("~/.qlib/qlib_data/cn_data").expanduser())
+            if cls._initialized_provider_uri is not None:
+                return cls._initialized_provider_uri
 
         if provider_uri is None:
             # 优先查找本地已存在的官方 Qlib 数据目录
@@ -92,12 +130,13 @@ class QlibDataProviderManager:
             else:
                 provider_uri = str(Path("~/.qlib/qlib_data/cn_data").expanduser())
 
-        cls.check_provider_ready(provider_uri)
+        cls.check_provider_ready(provider_uri, mode=mode)
 
-        logger.info(f"Initializing official Qlib with provider_uri='{provider_uri}', region='{region}'...")
+        logger.info(f"Initializing official Qlib with provider_uri='{provider_uri}', region='{region}', mode='{mode}'...")
         try:
             qlib.init(provider_uri=provider_uri, region=region)
             cls._initialized = True
+            cls._initialized_provider_uri = provider_uri
             logger.info("Qlib initialized successfully.")
             return provider_uri
         except Exception as e:
@@ -117,7 +156,7 @@ class QlibDataProviderManager:
         for ts_code, group in df.groupby("ts_code"):
             q_sym = to_qlib_symbol(ts_code)
             sub = group.sort_values("trade_date").copy()
-            
+
             sub_csv = pd.DataFrame({
                 "symbol": q_sym,
                 "date": pd.to_datetime(sub["trade_date"]).dt.strftime("%Y-%m-%d"),
@@ -129,10 +168,9 @@ class QlibDataProviderManager:
                 "factor": sub["adj_factor"] if "adj_factor" in sub.columns else 1.0,
                 "change": sub["pct_chg"] if "pct_chg" in sub.columns else 0.0,
             })
-            
+
             file_path = out_path / f"{q_sym}.csv"
             sub_csv.to_csv(file_path, index=False)
 
         logger.info(f"Exported {len(df['ts_code'].unique())} stock CSVs to '{out_path}' for official Qlib dump_bin.")
         return str(out_path)
-
