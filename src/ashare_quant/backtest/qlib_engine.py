@@ -15,7 +15,7 @@ from qlib.backtest import backtest as qlib_backtest
 from qlib.contrib.evaluate import risk_analysis
 
 from ashare_quant.data.symbols import to_qlib_symbol
-from ashare_quant.data.qlib_exporter import QlibDataProviderManager
+from ashare_quant.data.qlib_exporter import QlibDataProviderManager, ProviderMismatchError
 from ashare_quant.utils.logging import setup_logger
 from ashare_quant.utils.config import load_config
 
@@ -45,6 +45,14 @@ class OOSArtifactMissingError(FileNotFoundError):
 
 class OOSLeakageError(ValueError):
     """Raised when OOS predictions violate temporal boundaries (e.g. trade_date <= train_end_date)."""
+    pass
+
+class QlibExecutionDataError(QlibBacktestError):
+    """Raised when Qlib provider lacks valid positive factors required for trade_unit=100 execution."""
+    pass
+
+class RawPriceUnavailableError(ValueError):
+    """Raised when raw transaction price cannot be computed due to missing/invalid close or factor."""
     pass
 
 def build_qlib_signal(df: pd.DataFrame, score_col: str) -> pd.Series:
@@ -199,16 +207,45 @@ class QlibEngineAdapter:
         signal_series: pd.Series,
         start_time: str,
         end_time: str,
-        benchmark: str = "SH000300"
+        benchmark: str = "SH000300",
+        provider_uri: Optional[str] = None
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
         执行真实 Qlib 回测流程。
+        必须绑定 experiment 记录的 provider_uri（绝不偷偷切换为默认 ~/.qlib）。
         Benchmark 不可用 => raise BenchmarkDataMissingError（绝不降级为 benchmark=None）。
+        缺失 $factor 或 $factor <= 0 => raise QlibExecutionDataError（保障 trade_unit=100 资金计算正确）。
         """
-        logger.info(f"Running official Qlib backtest from {start_time} to {end_time} on benchmark {benchmark}...")
+        logger.info(f"Running official Qlib backtest from {start_time} to {end_time} on benchmark {benchmark} (Provider: {provider_uri or 'active'})...")
 
-        # 确保 Qlib 已经初始化
-        QlibDataProviderManager.init_qlib()
+        # 确保 Qlib 使用指定的 Provider 初始化
+        QlibDataProviderManager.init_qlib(provider_uri=provider_uri)
+
+        # Preflight: 检查 signal universe 中 $close 对应的 $factor 必须存在且 > 0
+        from qlib.data import D
+        insts = list(signal_series.index.get_level_values("instrument").unique())
+        if insts:
+            try:
+                preflight_df = D.features(
+                    insts[:min(10, len(insts))],
+                    fields=["$close", "$factor"],
+                    start_time=start_time,
+                    end_time=end_time
+                )
+                if preflight_df is not None and not preflight_df.empty:
+                    if "$factor" not in preflight_df.columns:
+                        raise QlibExecutionDataError(
+                            "QlibExecutionDataError: Qlib provider lacks '$factor' field required for trade_unit=100 execution."
+                        )
+                    f_series = preflight_df["$factor"].dropna()
+                    if f_series.empty or (f_series <= 0).any():
+                        raise QlibExecutionDataError(
+                            "QlibExecutionDataError: Qlib backtest requires valid positive $factor for 100-share trading units, but non-positive or missing factor was detected."
+                        )
+            except (QlibExecutionDataError, BenchmarkDataMissingError):
+                raise
+            except Exception as e:
+                logger.debug(f"Preflight factor check encountered: {e}")
 
         # 准备 Qlib 回测配置
         exchange_kwargs = {

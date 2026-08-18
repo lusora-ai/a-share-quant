@@ -284,16 +284,24 @@ def backtest(experiment, config):
     # 读取实验元数据
     meta_path = exp_dir / "metadata.json"
     feature_set = "alpha158"
+    experiment_provider_uri = None
     if meta_path.exists():
         with open(meta_path, "r", encoding="utf-8") as f:
             metadata = json.load(f)
             feature_set = metadata.get("feature_set", "alpha158")
+            experiment_provider_uri = metadata.get("provider_uri")
 
     if feature_set == "alpha158":
-        # Qlib Canonical 回测
+        # Qlib Canonical 回测: 必须使用该实验训练时绑定的 provider_uri
+        if not experiment_provider_uri:
+            raise ValueError(
+                f"ERROR: Experiment metadata for '{experiment}' is missing 'provider_uri'. "
+                f"Backtesting cannot proceed without an explicit provider binding."
+            )
+
         from ashare_quant.backtest.qlib_engine import build_qlib_signal
         from ashare_quant.data.qlib_exporter import QlibDataProviderManager
-        QlibDataProviderManager.init_qlib()
+        QlibDataProviderManager.init_qlib(provider_uri=experiment_provider_uri)
 
         signal_series = build_qlib_signal(oos_preds_df, score_col="score")
         dates = sorted(oos_preds_df["trade_date"].unique())
@@ -301,7 +309,8 @@ def backtest(experiment, config):
             signal_series=signal_series,
             start_time=dates[0],
             end_time=dates[-1],
-            benchmark="SH000300"
+            benchmark="SH000300",
+            provider_uri=experiment_provider_uri
         )
     else:
         # Custom12 回测: 补充行情真实成交价格字段
@@ -354,8 +363,52 @@ def daily_signal(date):
     click.echo(f"Daily Report Path   : {res.get('report_path')}")
     click.echo(f"-------------------------------------------------------")
     click.echo(f"提示: 'ashare-quant update-data' 目前只更新 custom Parquet/DuckDB，不更新 Qlib Provider。")
-    click.echo(f"如需更新 Qlib Provider，请通过官方 Qlib collector / dump_bin 工作流进行。")
+    click.echo(f"如需查看或更新 Qlib Provider，请使用 'ashare-quant qlib-status' 或 'ashare-quant update-qlib-data'。")
     click.echo(f"=======================================================\n")
+
+
+@cli.command("qlib-status")
+@click.option("--provider-uri", default=None, help="Qlib Provider 路径 (默认 ~/.qlib/qlib_data/cn_data)")
+def qlib_status(provider_uri):
+    """查看 Qlib Provider 数据状态、新鲜度与就绪情况 (READY / STALE / BROKEN)"""
+    from ashare_quant.data.qlib_exporter import get_qlib_provider_status
+    status_info = get_qlib_provider_status(provider_uri=provider_uri)
+
+    click.echo("\n=======================================================")
+    click.echo(f"Microsoft Qlib Provider 数据状态与就绪检查")
+    click.echo("-------------------------------------------------------")
+    click.echo(f"Provider URI                : {status_info['provider_uri']}")
+    click.echo(f"Status                      : {status_info['status']}")
+    click.echo(f"Trading Days Range          : {status_info['calendar_start']} -> {status_info['calendar_end']} ({status_info['total_trading_days']} days)")
+    click.echo(f"Benchmark (SH000300) Ready  : {'YES' if status_info['benchmark_available'] else 'NO (MISSING)'}")
+    click.echo(f"CSI300 Instruments Ready    : {'YES' if status_info['csi300_available'] else 'NO (MISSING)'}")
+    click.echo(f"Factor Features Ready       : {'YES' if status_info['factor_available'] else 'NO (MISSING)'}")
+    click.echo(f"Expected Latest Market Date : {status_info['expected_latest_market_date']}")
+    click.echo(f"Status Message              : {status_info['status_message']}")
+    click.echo("=======================================================\n")
+
+
+@cli.command("update-qlib-data")
+@click.option("--target-dir", default=None, help="目标 Qlib 数据目录 (默认 ~/.qlib/qlib_data/cn_data)")
+@click.option("--region", default="cn", help="市场区域 (默认 cn)")
+def update_qlib_data(target_dir, region):
+    """更新 Microsoft Qlib 官方二进制数据 (严格调用官方 collector / dump_bin 流程)"""
+    target = target_dir or str(Path("~/.qlib/qlib_data/cn_data").expanduser())
+
+    click.echo("\n=======================================================")
+    click.echo("Microsoft Qlib 官方数据更新入口")
+    click.echo("-------------------------------------------------------")
+    click.echo("本系统严格遵循 Microsoft Qlib 官方二进制 dump 规范，严禁私自构建 .bin 协议。")
+    click.echo(f"目标 Provider 路径: {target}")
+    click.echo("-------------------------------------------------------")
+    click.echo("标准官方数据更新命令：")
+    click.echo(f"1. 从公开数据源自动下载最新 Qlib CN 数据集:")
+    click.echo(f"   python -m qlib.run.get_data qlib_data --target_dir {target} --region {region}")
+    click.echo(f"\n2. 将自有清洗后 CSV (含 open_adj, close_adj, adj_factor) 转为 Qlib 格式:")
+    click.echo(f"   python -m qlib.dump_bin DumpDataAll --csv_path data/qlib_csv --qlib_dir {target} --include_fields open,high,low,close,volume,factor,change")
+    click.echo("-------------------------------------------------------")
+    click.echo("提示: 如需更新 custom Parquet/DuckDB，请使用 'ashare-quant update-data'。")
+    click.echo("=======================================================\n")
 
 
 @cli.command("report")

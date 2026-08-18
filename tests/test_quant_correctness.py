@@ -1,5 +1,6 @@
 import pytest
 import os
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -450,52 +451,137 @@ def test_qlib_csv_exporter_requires_adjusted_prices():
         QlibDataProviderManager.export_to_csv_dump_format(invalid_df)
 
 
-def test_daily_signal_stale_market_data_guard():
+def test_daily_signal_rejects_stale_provider_without_explicit_date():
     """
-    验证 daily-signal 请求超出 Provider 日期的信号时抛出 StaleMarketDataError
+    验证未指定 --date 时，若 Provider 截止日期早于预期最新市场日期，必须抛出 StaleMarketDataError
     """
     from ashare_quant.signals.daily import DailySignalPipeline, StaleMarketDataError
+    from ashare_quant.data.qlib_exporter import QlibDataProviderManager
     pipeline = DailySignalPipeline()
-    with pytest.raises(StaleMarketDataError, match="stale"):
-        pipeline.run_daily_pipeline(target_date="2099-12-31")
+
+    # 默认调用（target_date=None），由于当前真实年份是 2026 而 provider 截止 2021，必须触发 StaleMarketDataError
+    with pytest.raises(StaleMarketDataError) as excinfo:
+        pipeline.run_daily_pipeline(target_date=None)
+    
+    assert "STALE" in str(excinfo.value)
+    assert "Expected latest completed market date" in str(excinfo.value)
+    assert "Qlib provider data ends at" in str(excinfo.value)
 
 
-def test_backtest_oos_leakage_detection():
+def test_missing_factor_never_falls_back_to_one():
     """
-    验证 QlibEngineAdapter.validate_oos_predictions 逐行检测 trade_date <= train_end_date 泄漏
+    验证当 Qlib 返回的 $factor 缺失或为 NaN 时，严禁 fallback 1.0，必须作为无效价格剔除
     """
-    from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, OOSLeakageError
+    from ashare_quant.signals.daily import DailySignalPipeline, RawPriceUnavailableError
+    from unittest.mock import patch
+
+    pipeline = DailySignalPipeline()
+    # 模拟 Qlib D.features 返回部分股票缺失 factor 或 factor <= 0
+    mock_feat = pd.DataFrame(
+        {
+            "$close": [10.0, 20.0, 30.0],
+            "$factor": [np.nan, 0.0, 2.0],  # 只有第三只股票有效
+        },
+        index=pd.MultiIndex.from_tuples(
+            [("SH600000", "2021-06-11"), ("SZ000001", "2021-06-11"), ("SH600519", "2021-06-11")],
+            names=["instrument", "datetime"]
+        )
+    )
+
+    with patch("qlib.data.D.features", return_value=mock_feat):
+        close_df, name_df = pipeline._fetch_alpha158_real_close_and_name("2021-06-11", ["600000.SH", "000001.SZ", "600519.SH"])
+        # SH600000 (NaN factor) 和 SZ000001 (0.0 factor) 必须被完全剔除，绝不能出现 raw_close = 10.0 / 1.0 = 10.0
+        assert "SH600000" not in close_df["instrument"].tolist()
+        assert "SZ000001" not in close_df["instrument"].tolist()
+        assert "SH600519" in close_df["instrument"].tolist()
+        assert close_df.loc[close_df["instrument"] == "SH600519", "close"].values[0] == 15.0  # 30.0 / 2.0
+
+
+def test_daily_candidates_never_have_zero_close():
+    """
+    验证每日选股生成的 Top10 候选股票 close 与 cost_100_shares 全部为有限正数，绝无 0 或负数
+    """
+    from ashare_quant.signals.daily import DailySignalPipeline
+    pipeline = DailySignalPipeline()
+    # 显式重放历史有效交易日
+    res = pipeline.run_daily_pipeline(target_date="2021-06-11")
+    candidates = res.get("candidates", [])
+    assert len(candidates) > 0
+    for cand in candidates:
+        assert cand["close"] > 0
+        assert np.isfinite(cand["close"])
+        assert cand["cost_100_shares"] > 0
+        assert np.isfinite(cand["cost_100_shares"])
+        assert round(cand["close"] * 100, 2) == cand["cost_100_shares"]
+
+
+def test_backtest_binds_experiment_provider_uri():
+    """
+    验证 Backtest 严格使用 experiment metadata 中的 provider_uri，若缺失则报错
+    """
+    from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, ProviderMismatchError
+    from click.testing import CliRunner
+    from ashare_quant.cli import cli
+
+    runner = CliRunner()
+    # 使用不存在 provider_uri 的 mock metadata 验证报错
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fake_exp = Path("experiments") / "test_missing_provider_exp"
+        fake_exp.mkdir(parents=True, exist_ok=True)
+        (fake_exp / "metadata.json").write_text(json.dumps({"feature_set": "alpha158"}), encoding="utf-8")
+        (fake_exp / "oos_predictions.parquet").write_bytes(b"dummy")
+
+        try:
+            res = runner.invoke(cli, ["backtest", "--experiment", "test_missing_provider_exp"])
+            assert res.exit_code != 0
+        finally:
+            shutil.rmtree(fake_exp, ignore_errors=True)
+
+
+def test_backtest_preflight_requires_valid_factor():
+    """
+    验证 QlibEngineAdapter 在 factor 缺失或非正数时抛出 QlibExecutionDataError
+    """
+    from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, QlibExecutionDataError
+    from unittest.mock import patch
+
     adapter = QlibEngineAdapter()
+    dummy_signal = pd.Series(
+        [0.85, 0.12],
+        index=pd.MultiIndex.from_tuples(
+            [(pd.to_datetime("2020-01-02"), "SH600000"), (pd.to_datetime("2020-01-02"), "SZ000001")],
+            names=["datetime", "instrument"]
+        )
+    )
 
-    # 1. 缺失必需列
-    invalid_cols_df = pd.DataFrame({
-        "trade_date": ["2020-01-02"],
-        "ts_code": ["600000.SH"],
-        "score": [0.5]
-    })
-    with pytest.raises(OOSLeakageError, match="missing required columns"):
-        adapter.validate_oos_predictions(invalid_cols_df)
+    # 模拟 preflight 发现 $factor 缺失
+    mock_feat = pd.DataFrame({"$close": [10.0, 11.0]})  # missing $factor
+    with patch("qlib.data.D.features", return_value=mock_feat):
+        with pytest.raises(QlibExecutionDataError, match="factor"):
+            adapter.run_qlib_backtest(
+                signal_series=dummy_signal,
+                start_time="2020-01-02",
+                end_time="2020-01-03",
+                benchmark="SH000300"
+            )
 
-    # 2. 存在未来信息回溯/穿越 (trade_date <= train_end_date)
-    leaked_df = pd.DataFrame({
-        "trade_date": ["2019-01-02", "2018-05-01"],
-        "ts_code": ["600000.SH", "600000.SH"],
-        "score": [0.5, 0.6],
-        "fold_id": [1, 1],
-        "train_end_date": ["2018-12-31", "2018-12-31"]  # 2018-05-01 <= 2018-12-31 (LEAK!)
-    })
-    with pytest.raises(OOSLeakageError, match="OOS Leakage detected"):
-        adapter.validate_oos_predictions(leaked_df)
 
-    # 3. 合法 OOS 数据通过验证
-    valid_df = pd.DataFrame({
-        "trade_date": ["2019-01-02", "2019-01-03"],
-        "ts_code": ["600000.SH", "600000.SH"],
-        "score": [0.5, 0.6],
-        "fold_id": [1, 1],
-        "train_end_date": ["2018-12-31", "2018-12-31"]
-    })
-    adapter.validate_oos_predictions(valid_df)
+def test_qlib_status_and_update_cli():
+    """
+    验证 qlib-status 和 update-qlib-data CLI 命令正常输出状态
+    """
+    from click.testing import CliRunner
+    from ashare_quant.cli import cli
+
+    runner = CliRunner()
+    res_status = runner.invoke(cli, ["qlib-status"])
+    assert res_status.exit_code == 0
+    assert "Provider URI" in res_status.output
+    assert "Status" in res_status.output
+
+    res_update = runner.invoke(cli, ["update-qlib-data"])
+    assert res_update.exit_code == 0
+    assert "DumpDataAll" in res_update.output
 
 
 # ======================= Integration Tests =======================

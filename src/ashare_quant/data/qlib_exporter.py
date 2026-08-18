@@ -6,8 +6,10 @@ Zero fake binary mocks, zero fake benchmark constants.
 import os
 import shutil
 from pathlib import Path
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 import pandas as pd
+from pandas.tseries.offsets import BDay
 import numpy as np
 import qlib
 from qlib.constant import REG_CN
@@ -27,6 +29,106 @@ class ProviderMismatchError(RuntimeError):
 class DataSchemaError(ValueError):
     """Raised when required adjusted price columns are missing for export."""
     pass
+
+def get_expected_latest_completed_trade_date(reference_time: Optional[datetime] = None) -> str:
+    """
+    计算当前预期最新已完成结算的 A 股交易日 (YYYY-MM-DD)。
+    如果在交易日 15:30 之前，则为上一个交易日；如果已过 15:30，则为当日。
+    """
+    now = reference_time or datetime.now()
+    # A股 15:00 收盘，15:30 结算完毕
+    is_after_market_close = (now.hour > 15) or (now.hour == 15 and now.minute >= 30)
+
+    # 优先从 storage 的 trade_calendar 获取
+    try:
+        from ashare_quant.data.processor import DataProcessor
+        proc = DataProcessor()
+        try:
+            df_cal = proc.storage.load_parquet("trade_calendar", is_processed=True)
+        finally:
+            proc.close()
+        if df_cal is not None and not df_cal.empty and "trade_date" in df_cal.columns:
+            today_str = now.strftime("%Y-%m-%d")
+            if is_after_market_close:
+                valid_dates = df_cal[df_cal["trade_date"] <= today_str]["trade_date"].tolist()
+            else:
+                valid_dates = df_cal[df_cal["trade_date"] < today_str]["trade_date"].tolist()
+            if valid_dates:
+                return str(sorted(valid_dates)[-1])
+    except Exception:
+        pass
+
+    # Fallback: 使用工作日计算
+    if is_after_market_close and now.weekday() < 5:
+        return now.strftime("%Y-%m-%d")
+    else:
+        prev_bday = now - BDay(1)
+        return prev_bday.strftime("%Y-%m-%d")
+
+def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, Any]:
+    """
+    检查指定或默认 Qlib Provider 的真实就绪与新鲜度状态 (READY / STALE / BROKEN)
+    """
+    if provider_uri is None:
+        provider_uri = str(Path("~/.qlib/qlib_data/cn_data").expanduser())
+
+    p = Path(provider_uri).expanduser().resolve()
+    cal_file = p / "calendars" / "day.txt"
+    all_inst_file = p / "instruments" / "all.txt"
+    csi300_file = p / "instruments" / "csi300.txt"
+    features_dir = p / "features"
+    benchmark_dir = features_dir / "sh000300"
+
+    expected_market_date = get_expected_latest_completed_trade_date()
+
+    if not p.exists() or not cal_file.exists() or not all_inst_file.exists() or not features_dir.exists():
+        return {
+            "provider_uri": str(p),
+            "status": "BROKEN",
+            "calendar_start": "N/A",
+            "calendar_end": "N/A",
+            "total_trading_days": 0,
+            "benchmark_available": False,
+            "csi300_available": False,
+            "factor_available": False,
+            "expected_latest_market_date": expected_market_date,
+            "status_message": f"Provider directory '{p}' is missing or incomplete."
+        }
+
+    calendar_dates = [line.strip() for line in cal_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    cal_start = calendar_dates[0] if calendar_dates else "N/A"
+    cal_end = calendar_dates[-1] if calendar_dates else "N/A"
+    total_days = len(calendar_dates)
+
+    benchmark_avail = benchmark_dir.exists() and (benchmark_dir / "close.day.bin").exists()
+    csi300_avail = csi300_file.exists()
+
+    # 检查 factor.day.bin 是否存在
+    sample_stocks = [d for d in features_dir.iterdir() if d.is_dir() and not d.name.startswith("sh000300")]
+    factor_avail = any((s / "factor.day.bin").exists() for s in sample_stocks[:10])
+
+    if not benchmark_avail or not csi300_avail or not factor_avail or total_days == 0:
+        status = "BROKEN"
+        msg = "Provider is missing benchmark, csi300 instruments, or factor feature bins."
+    elif cal_end < expected_market_date:
+        status = "STALE"
+        msg = f"Provider data ends at '{cal_end}', older than expected market date '{expected_market_date}'."
+    else:
+        status = "READY"
+        msg = "Provider data is complete, benchmark ready, and fully up-to-date."
+
+    return {
+        "provider_uri": str(p),
+        "status": status,
+        "calendar_start": cal_start,
+        "calendar_end": cal_end,
+        "total_trading_days": total_days,
+        "benchmark_available": benchmark_avail,
+        "csi300_available": csi300_avail,
+        "factor_available": factor_avail,
+        "expected_latest_market_date": expected_market_date,
+        "status_message": msg
+    }
 
 class QlibDataProviderManager:
     """

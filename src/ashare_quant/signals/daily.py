@@ -12,8 +12,9 @@ import pandas as pd
 import numpy as np
 
 from ashare_quant.data.processor import DataProcessor
+from ashare_quant.data.processor import DataProcessor
 from ashare_quant.data.symbols import from_qlib_symbol, to_qlib_symbol
-from ashare_quant.data.qlib_exporter import QlibDataProviderManager
+from ashare_quant.data.qlib_exporter import QlibDataProviderManager, get_expected_latest_completed_trade_date
 from ashare_quant.features.custom12 import Custom12Factors, FACTOR_NAMES_12
 from ashare_quant.features.qlib_alpha158 import OfficialQlibAlpha158
 from ashare_quant.universe.filter import build_custom12_universe
@@ -23,7 +24,11 @@ from ashare_quant.utils.logging import setup_logger
 logger = setup_logger("ashare_quant.signals.daily")
 
 class StaleMarketDataError(RuntimeError):
-    """Raised when requesting a signal date beyond the available provider data."""
+    """Raised when requesting a signal date beyond the available provider data or when provider is stale."""
+    pass
+
+class RawPriceUnavailableError(ValueError):
+    """Raised when raw transaction price cannot be computed due to missing/invalid close or factor."""
     pass
 
 class DailySignalPipeline:
@@ -77,7 +82,8 @@ class DailySignalPipeline:
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         使用 Qlib Data API (from qlib.data import D) 读取 $close 和 $factor。
-        计算真实未复权成交参考价: raw_close = $close / $factor (禁止直接把复权 close.day.bin 当真实股价)。
+        计算真实未复权成交参考价: raw_close = $close / $factor。
+        严格要求 $close 与 $factor 均为有限正数；缺失时直接剔除或报错，严禁 fallback 1.0 或 0.0。
         """
         from qlib.data import D
 
@@ -93,16 +99,29 @@ class DailySignalPipeline:
             raise RuntimeError(f"Failed to fetch $close and $factor from Qlib for date '{calc_date}': {e}") from e
 
         if price_df is None or price_df.empty:
-            raise RuntimeError(f"Qlib returned empty features for date '{calc_date}'.")
+            raise RawPriceUnavailableError(f"Qlib returned empty features for date '{calc_date}'.")
 
         price_df = price_df.reset_index()
         if "$close" not in price_df.columns or "$factor" not in price_df.columns:
-            raise RuntimeError(f"Qlib features missing $close or $factor. Columns: {list(price_df.columns)}")
+            raise RawPriceUnavailableError(f"Qlib features missing $close or $factor. Columns: {list(price_df.columns)}")
 
         price_df["instrument"] = price_df["instrument"].astype(str)
-        factor = price_df["$factor"].replace(0, np.nan).fillna(1.0)
-        price_df["raw_close"] = (price_df["$close"] / factor).round(2)
-        close_df = price_df[["instrument", "raw_close"]].rename(columns={"raw_close": "close"}).dropna()
+
+        # 严格校验: $close 与 $factor 必须均为有限正数，严禁 fillna(1.0)
+        valid_mask = (
+            pd.notna(price_df["$close"]) & np.isfinite(price_df["$close"]) & (price_df["$close"] > 0) &
+            pd.notna(price_df["$factor"]) & np.isfinite(price_df["$factor"]) & (price_df["$factor"] > 0)
+        )
+        valid_price_df = price_df[valid_mask].copy()
+
+        if valid_price_df.empty:
+            raise RawPriceUnavailableError(
+                f"RawPriceUnavailableError: No instruments have valid positive $close and $factor for date '{calc_date}'. "
+                f"Raw transaction price cannot be computed."
+            )
+
+        valid_price_df["raw_close"] = (valid_price_df["$close"] / valid_price_df["$factor"]).round(2)
+        close_df = valid_price_df[["instrument", "raw_close"]].rename(columns={"raw_close": "close"})
 
         # 证券名称：尝试从项目 stock_master 匹配
         name_df = pd.DataFrame(columns=["instrument", "name"])
@@ -140,6 +159,9 @@ class DailySignalPipeline:
         feature_set = meta.get("feature_set", "custom12")
         feature_cols = meta.get("feature_cols", FACTOR_NAMES_12)
 
+        # 获取预期最新已完成结算的市场交易日
+        expected_latest_market_date = get_expected_latest_completed_trade_date()
+
         # 2. 根据 feature_set 分发执行
         if feature_set == "alpha158":
             # ===== Qlib Alpha158 Pipeline =====
@@ -150,8 +172,17 @@ class DailySignalPipeline:
             calendar_dates = [line.strip() for line in cal_file.read_text(encoding="utf-8").splitlines() if line.strip()]
             provider_data_end_date = calendar_dates[-1]
 
-            # Provider Freshness Guard: 校验信号日期与 Provider 数据新鲜度
-            if target_date is not None:
+            # Provider Freshness Guard: 校验 Provider 是否过期
+            if target_date is None:
+                if provider_data_end_date < expected_latest_market_date:
+                    raise StaleMarketDataError(
+                        f"Qlib provider market data is STALE! Expected latest completed market date: '{expected_latest_market_date}', "
+                        f"but Qlib provider data ends at: '{provider_data_end_date}'. Daily Signal generation for today is blocked. "
+                        f"Please update Qlib provider data, or pass --date <HISTORICAL_DATE> to replay historical signals."
+                    )
+                calc_date = provider_data_end_date
+            else:
+                # 允许显式指定历史日期重放
                 if target_date > provider_data_end_date:
                     raise StaleMarketDataError(
                         f"Requested signal date '{target_date}' exceeds Qlib provider latest date '{provider_data_end_date}'. "
@@ -160,8 +191,6 @@ class DailySignalPipeline:
                 if target_date not in calendar_dates:
                     raise ValueError(f"ERROR: requested date unavailable in Qlib calendar: '{target_date}'.")
                 calc_date = target_date
-            else:
-                calc_date = provider_data_end_date
 
             logger.info(f"Computing official Qlib Alpha158 features for date '{calc_date}' (Provider End: {provider_data_end_date})...")
             alpha_adapter = OfficialQlibAlpha158()
@@ -187,8 +216,15 @@ class DailySignalPipeline:
 
             # 获取真实未复权 raw close 与证券名称 (通过 Qlib Data API: $close / $factor)
             close_df, name_df = self._fetch_alpha158_real_close_and_name(calc_date, pred_df["ts_code"].tolist())
-            pred_df = pred_df.merge(close_df, on="instrument", how="left")
-            pred_df["close"] = pred_df["close"].fillna(0.0)
+            
+            # 严格使用 inner merge，剔除无法获取有效真实股价的标的，严禁 fillna(0.0)
+            pred_df = pred_df.merge(close_df, on="instrument", how="inner")
+            pred_df = pred_df[pd.notna(pred_df["close"]) & np.isfinite(pred_df["close"]) & (pred_df["close"] > 0)].copy()
+
+            if pred_df.empty:
+                raise RawPriceUnavailableError(
+                    f"RawPriceUnavailableError: No scored instruments have valid positive raw close prices for date '{calc_date}'."
+                )
 
             pred_df = pred_df.merge(name_df, on="instrument", how="left")
             pred_df["name"] = pred_df["name"].fillna(pred_df["ts_code"])
@@ -213,8 +249,16 @@ class DailySignalPipeline:
             available_dates = sorted(df_daily["trade_date"].unique())
             custom_data_end_date = available_dates[-1]
 
-            # P1-3: target_date 禁止 silent fallback
-            if target_date is not None:
+            # Freshness Guard: 校验 Custom12 数据是否过期
+            if target_date is None:
+                if custom_data_end_date < expected_latest_market_date:
+                    raise StaleMarketDataError(
+                        f"Daily market data is STALE! Expected latest completed market date: '{expected_latest_market_date}', "
+                        f"but data ends at: '{custom_data_end_date}'. Please run 'ashare-quant update-data' first, "
+                        f"or pass --date <HISTORICAL_DATE> to replay historical signals."
+                    )
+                calc_date = custom_data_end_date
+            else:
                 if target_date > custom_data_end_date:
                     raise StaleMarketDataError(
                         f"Requested signal date '{target_date}' exceeds daily market data end '{custom_data_end_date}'. "
@@ -223,8 +267,6 @@ class DailySignalPipeline:
                 if target_date not in available_dates:
                     raise ValueError(f"ERROR: requested date unavailable: '{target_date}'.")
                 calc_date = target_date
-            else:
-                calc_date = custom_data_end_date
 
             # 共享 universe 过滤 (与 train 严格复用同一函数)
             df_universe = build_custom12_universe(df_daily, master_df=df_master)
@@ -247,13 +289,20 @@ class DailySignalPipeline:
             except Exception as e:
                 raise RuntimeError(f"ERROR: Model prediction failed: {e}") from e
 
-        # 3. 排序选出 Top10 候选股票
+        # 3. 排序选出 Top10 候选股票 (严格要求 close > 0, cost_100_shares > 0)
         df_sorted = df_scored.sort_values("score", ascending=False).reset_index(drop=True)
-        top10 = df_sorted.head(10)
+        # 过滤掉价格无效或 <= 0 的股票
+        df_valid_candidates = df_sorted[pd.notna(df_sorted["close"]) & np.isfinite(df_sorted["close"]) & (df_sorted["close"] > 0)].copy()
+        if df_valid_candidates.empty:
+            raise RawPriceUnavailableError(f"RawPriceUnavailableError: No candidate stocks with valid positive prices available on '{calc_date}'.")
+        top10 = df_valid_candidates.head(10)
 
         candidates = []
         for rank, row in enumerate(top10.to_dict("records"), 1):
-            close_val = float(row.get("close", 0.0))
+            close_val = float(row.get("close"))
+            if not np.isfinite(close_val) or close_val <= 0:
+                continue
+            cost_100 = round(close_val * 100, 2)
             candidates.append({
                 "trade_date": calc_date,
                 "rank": rank,
@@ -262,7 +311,7 @@ class DailySignalPipeline:
                 "score": float(row.get("score", 0.0)),
                 "industry": row.get("industry", "N/A"),
                 "close": close_val,
-                "cost_100_shares": round(close_val * 100, 2),
+                "cost_100_shares": cost_100,
                 "model_id": exp_id,
             })
 
