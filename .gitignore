@@ -7,6 +7,8 @@ __pycache__/
 data/raw/
 data/processed/
 data/cache/
+data/qlib_cn/
+scratch/
 *.duckdb
 *.parquet
 
@@ -20,8 +22,16 @@ venv/
 .coverage
 htmlcov/
 
+# Experiments, Models & Reports
+experiments/
+mlruns/
+reports/daily/
+*.joblib
+*.pkl
+
 # IDE & OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+

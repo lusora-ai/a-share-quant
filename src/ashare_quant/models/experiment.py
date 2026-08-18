@@ -1,13 +1,35 @@
 import os
 import json
 import yaml
+import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import pandas as pd
 from ashare_quant.utils.logging import setup_logger
 
 logger = setup_logger("ashare_quant.models.experiment")
+
+class OOSArtifactMissingError(FileNotFoundError):
+    """Raised when an experiment archive lacks oos_predictions.parquet.
+
+    predictions.parquet is a legacy artifact and is NEVER accepted as a substitute:
+    only strictly out-of-sample predictions may enter backtesting.
+    """
+    pass
+
+def get_git_commit_sha() -> str:
+    """获取当前 Git Commit SHA，若非 git 环境则返回 'unknown'"""
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return res.stdout.strip()
+    except Exception:
+        return "unknown"
 
 class ExperimentTracker:
     """
@@ -18,31 +40,74 @@ class ExperimentTracker:
         self.base_dir = Path(base_exp_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
-    def create_experiment(self, name: str, config: Dict[str, Any]) -> str:
+    def create_experiment(
+        self,
+        name: str,
+        config: Dict[str, Any],
+        feature_set: str = "custom12",
+        model_type: str = "native_lgbm",
+        feature_cols: Optional[List[str]] = None,
+        label_spec: Optional[Dict[str, Any]] = None,
+        walk_forward_config: Optional[Dict[str, Any]] = None,
+        universe: Optional[Dict[str, Any]] = None,
+        research_start_date: Optional[str] = None,
+        research_end_date: Optional[str] = None,
+        provider_data_end_date: Optional[str] = None,
+        train_end_date: Optional[str] = None,
+        data_end_date: Optional[str] = None,
+        label_mature_end_date: Optional[str] = None,
+        production_train_end_date: Optional[str] = None,
+        data_snapshot_id: Optional[str] = None,
+        provider_uri: Optional[str] = None
+    ) -> str:
         """
-        创建一个唯一 experiment_id 并创建归档文件夹
-        例如: 20260813_001_momentum_lgbm
+        创建一个唯一 experiment_id 并创建归档文件夹，记录完整元数据
+
+        日期语义（5D future label 下严格分离）:
+        - research_start_date: Walk-Forward 历史研究/OOS评估起始日期
+        - research_end_date: Walk-Forward 历史研究/OOS评估截止日期
+        - provider_data_end_date: 真实 Provider 包含的最新交易日 (不被 walk_forward 过滤截断)
+        - production_train_end_date: 生产模型实际训练截止 (provider_data_end - horizon)
+        - label_mature_end_date: 最后一个标签成熟的交易日 (= production_train_end_date)
+        - data_end_date: 兼容别名 (= provider_data_end_date)
+        - train_end_date: 兼容别名 (= production_train_end_date)
         """
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         exp_id = f"{timestamp_str}_{name}"
         exp_dir = self.base_dir / exp_id
         exp_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # 1. 保存 config.yaml
         with open(exp_dir / "config.yaml", "w", encoding="utf-8") as f:
             yaml.dump(config, f, allow_unicode=True)
-            
-        # 2. 保存 metadata.json
+
+        # 2. 保存 metadata.json (完整核心追溯字段)
         meta = {
             "experiment_id": exp_id,
             "created_at": datetime.now().isoformat(),
             "name": name,
+            "feature_set": feature_set,
+            "model_type": model_type,
+            "feature_cols": feature_cols or [],
+            "label_spec": label_spec or {},
+            "walk_forward_config": walk_forward_config or {},
+            "universe": universe or {},
+            "research_start_date": research_start_date or "",
+            "research_end_date": research_end_date or "",
+            "provider_data_end_date": provider_data_end_date or data_end_date or "",
+            "production_train_end_date": production_train_end_date or train_end_date or "",
+            "train_end_date": train_end_date or production_train_end_date or "",
+            "data_end_date": data_end_date or provider_data_end_date or "",
+            "label_mature_end_date": label_mature_end_date or production_train_end_date or "",
+            "data_snapshot_id": data_snapshot_id or f"snapshot_{timestamp_str}",
+            "provider_uri": provider_uri or "",
+            "git_commit_sha": get_git_commit_sha(),
             "random_seed": config.get("random_seed", 42),
             "python_version": os.sys.version
         }
         with open(exp_dir / "metadata.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
-            
+
         logger.info(f"Created new experiment archive directory: {exp_dir}")
         return exp_id
 
@@ -51,30 +116,37 @@ class ExperimentTracker:
         exp_id: str,
         metrics: Dict[str, Any],
         feature_importance: Optional[pd.DataFrame] = None,
-        predictions: Optional[pd.DataFrame] = None,
+        oos_predictions: Optional[pd.DataFrame] = None,
+        fold_metrics: Optional[pd.DataFrame] = None,
         notes: str = ""
     ):
         """
-        写回实验结果 (metrics.json, feature_importance.csv, predictions.parquet, notes.md)
+        写回实验结果 (metrics.json, fold_metrics.parquet, oos_predictions.parquet, feature_importance.csv, notes.md)
+
+        oos_predictions.parquet 是唯一允许进入回测的预测集 artifact。
         """
         exp_dir = self.base_dir / exp_id
         if not exp_dir.exists():
             raise FileNotFoundError(f"Experiment directory {exp_dir} does not exist.")
-            
+
         # 1. 写回 metrics.json
         with open(exp_dir / "metrics.json", "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2, ensure_ascii=False)
-            
-        # 2. 写回 feature_importance.csv
+
+        # 2. 写回 fold_metrics.parquet
+        if fold_metrics is not None and not fold_metrics.empty:
+            fold_metrics.to_parquet(exp_dir / "fold_metrics.parquet")
+
+        # 3. 写回 oos_predictions.parquet (唯一允许进入回测的预测集)
+        if oos_predictions is not None and not oos_predictions.empty:
+            oos_predictions.to_parquet(exp_dir / "oos_predictions.parquet")
+
+        # 4. 写回 feature_importance.csv
         if feature_importance is not None and not feature_importance.empty:
             feature_importance.to_csv(exp_dir / "feature_importance.csv", index=False, encoding="utf-8-sig")
-            
-        # 3. 写回 predictions.parquet
-        if predictions is not None and not predictions.empty:
-            predictions.to_parquet(exp_dir / "predictions.parquet")
-            
-        # 4. 写回 notes.md
+
+        # 5. 写回 notes.md
         with open(exp_dir / "notes.md", "w", encoding="utf-8") as f:
             f.write(f"# Experiment Notes: {exp_id}\n\n{notes}\n")
-            
+
         logger.info(f"Successfully logged metrics & artifacts for experiment '{exp_id}'.")

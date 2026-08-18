@@ -37,12 +37,28 @@
                用户查看候选与风险信息
                         │
                         ▼
-             同花顺 / 券商 App 手动执行
-```
+---
+
+## 二、 架构实现状态 (Architecture Status)
+
+| 核心组件 (Component) | 具体实现路径 (Implementation) | 集成状态 (Status) | 权威上游参考 (Upstream Reference) |
+| :--- | :--- | :--- | :--- |
+| **Qlib Alpha158 因子集** | `qlib.contrib.data.handler.Alpha158` / `Alpha158DL` | ✅ **REAL QLIB CALL** | [microsoft/qlib](https://github.com/microsoft/qlib) |
+| **Qlib LGBModel 模型** | `qlib.contrib.model.gbdt.LGBModel` + `DatasetH` | ✅ **REAL QLIB CALL** | [microsoft/qlib](https://github.com/microsoft/qlib) |
+| **Qlib 回测引擎** | `TopkDropoutStrategy` + `SimulatorExecutor` | ✅ **REAL QLIB CALL** | [microsoft/qlib](https://github.com/microsoft/qlib) |
+| **Qlib 评估指标** | `qlib.contrib.evaluate.risk_analysis` / `PortAnaRecord` | ✅ **REAL QLIB CALL** | [microsoft/qlib](https://github.com/microsoft/qlib) |
+| **PIT 动态成分股票池** | `PointInTimeMaster` (CSI300 历史有效成分过滤) | ✅ **PRODUCTION** | Point-in-Time Master |
+| **12 个基线量价因子** | `src/ashare_quant/features/custom12.py` | ✅ **IN-HOUSE / ADAPTED** | PIT 截面多因子库 |
+| **Purged Walk-Forward** | `PurgedWalkForwardEvaluator` (严格 5 日 Purge 隔离) | ✅ **PRODUCTION** | De Prado AFML 标准 |
+| **Legacy 简化回测** | `src/ashare_quant/backtest/legacy_backtest.py` | ❌ **PERMANENTLY DISABLED** | 已由 Qlib 官方回测内核全面接管 |
+
+> **说明与约束边界**：
+> 1. **涨跌停限制模式**：当前回测处于 `benchmark_mode: uniform_limit_threshold` (统一以 9.9% 涨跌停逼近 CSI300 主板标的约束)。后续接入全 A 股 PIT 精细化行情数据时将升级为逐股票历史状态表达式 (`limit_buy` / `limit_sell`)。在此之前系统不声称已完整覆盖创业板/科创板 20% 及 ST 5% 的全部复杂动态涨跌停。
+> 2. **基准代码**：统一采用 Qlib Canonical Symbol（如 `SH000300`）。
 
 ---
 
-## 二、 项目目录结构
+## 三、 项目目录结构
 
 ```text
 a-share-quant/

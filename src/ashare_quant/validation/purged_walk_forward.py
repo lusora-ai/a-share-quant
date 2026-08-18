@@ -1,85 +1,264 @@
+"""
+Purged Walk-Forward Cross-Validation Engine.
+Implements multi-fold sliding windows with strict label purging and embargo periods:
+  max(label_info_time(Train)) < min(feature_time(Valid))
+  max(label_info_time(Valid)) < min(feature_time(Test))
+
+Walk-forward parameters (train_years / val_years / test_years / embargo_days) are read
+from cfg["walk_forward"] unless explicitly overridden by the caller.
+Production NEVER silently generates reduced folds for short data: insufficient history
+raises InsufficientWalkForwardHistoryError. Tests that need short data must construct
+their own folds.
+"""
+from typing import List, Dict, Any, Tuple, Optional
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any, Tuple, Optional
-from ashare_quant.models.qlib_lgbm import QlibLGBMModelAdapter
+
 from ashare_quant.models.metrics import compute_daily_ic, compute_ic_stats
+from ashare_quant.models.native_lgbm import NativeLGBMModel
+from ashare_quant.models.sklearn_hgb import SklearnHGBModel
 from ashare_quant.utils.logging import setup_logger
 from ashare_quant.utils.config import load_config
 
 logger = setup_logger("ashare_quant.validation.purged_walk_forward")
 
+class LeakageBoundaryError(ValueError):
+    """Raised when Purge/Embargo boundaries are violated and future label info leaks into next segment."""
+    pass
+
+class InsufficientWalkForwardHistoryError(ValueError):
+    """Raised when the available date span cannot support the configured walk-forward folds.
+
+    Production evaluators must NOT degrade the experiment definition (e.g. auto-generating
+    2 shrunken folds) when history is short; they must fail loudly instead.
+    """
+    pass
+
+
+def resolve_walk_forward_config(
+    config: Optional[Dict[str, Any]],
+    train_years: Optional[int],
+    val_years: Optional[int],
+    test_years: Optional[int],
+    embargo_days: Optional[int],
+) -> Dict[str, int]:
+    """
+    统一解析 Walk-Forward 参数：显式入参优先，否则从 cfg["walk_forward"] 读取。
+    CLI / evaluator / metadata 必须使用完全一致的值。
+    """
+    cfg = config or {}
+    wf = cfg.get("walk_forward", {}) or {}
+    resolved = {
+        "train_years": train_years if train_years is not None else int(wf.get("train_years", 4)),
+        "val_years": val_years if val_years is not None else int(wf.get("val_years", 1)),
+        "test_years": test_years if test_years is not None else int(wf.get("test_years", 1)),
+        "embargo_days": embargo_days if embargo_days is not None else int(wf.get("embargo_days", 2)),
+    }
+    if resolved["train_years"] < 1 or resolved["val_years"] < 1 or resolved["test_years"] < 1:
+        raise ValueError(f"Invalid walk_forward parameters: {resolved}")
+    return resolved
+
+
+def create_model_by_type(model_type: str, feature_cols: List[str], config: Optional[Dict[str, Any]] = None):
+    """
+    根据配置显式创建对应的模型实例，绝不写死或静默替换
+    """
+    if model_type == "native_lgbm":
+        return NativeLGBMModel(config=config, feature_cols=feature_cols)
+    elif model_type == "sklearn_hgb":
+        return SklearnHGBModel(config=config, feature_cols=feature_cols)
+    else:
+        raise ValueError(
+            f"PurgedWalkForwardEvaluator supports DataFrame-based models: 'native_lgbm', 'sklearn_hgb'. "
+            f"Got '{model_type}'. For Qlib pipeline, use QlibWalkForwardEvaluator."
+        )
+
 class PurgedWalkForwardEvaluator:
     """
-    带有 Purge & Embargo 隔离期的 Purged Walk-Forward 滚动验证器
-    严格隔离未来 Label 数据跨界泄漏:
-    max(label_info_time(Train)) < min(feature_time(Valid))
+    带有 Purge & Embargo 隔离期的滚动 Walk-Forward 交叉验证器
     """
-    def __init__(self, horizon: int = 5, embargo_days: int = 2, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        horizon: int = 5,
+        embargo_days: Optional[int] = None,
+        train_years: Optional[int] = None,
+        val_years: Optional[int] = None,
+        test_years: Optional[int] = None,
+        config: Optional[Dict[str, Any]] = None
+    ):
+        self.config = config or load_config("model_lgbm")
+        resolved = resolve_walk_forward_config(
+            self.config, train_years, val_years, test_years, embargo_days
+        )
         self.horizon = horizon
-        self.embargo_days = embargo_days
-        self.config = config or load_config("model_lgbm").get("walk_forward", {})
+        self.embargo_days = resolved["embargo_days"]
+        self.train_years = resolved["train_years"]
+        self.val_years = resolved["val_years"]
+        self.test_years = resolved["test_years"]
+
+    def walk_forward_config(self) -> Dict[str, Any]:
+        """
+        返回当前 evaluator 实际使用的 walk-forward 参数（用于 metadata 记录，保持一致性）
+        """
+        return {
+            "train_years": self.train_years,
+            "val_years": self.val_years,
+            "test_years": self.test_years,
+            "embargo_days": self.embargo_days,
+            "horizon": self.horizon,
+        }
+
+    def generate_folds(self, all_dates: List[str]) -> List[Dict[str, Any]]:
+        """
+        生成严格的 Multi-Fold Walk-Forward 时间切片，并应用 Purge 边界。
+
+        正式研究数据不足时直接抛出 InsufficientWalkForwardHistoryError，
+        绝不自动生成缩小版 Fold 改变实验定义。
+        """
+        all_dt = pd.to_datetime(all_dates)
+        years = sorted(all_dt.year.unique())
+        folds = []
+
+        total_span = self.train_years + self.val_years + self.test_years
+        if len(years) >= total_span:
+            # 存在多年数据时，按年份滚动生成
+            for i in range(len(years) - total_span + 1):
+                train_yrs = years[i : i + self.train_years]
+                val_yr = years[i + self.train_years : i + self.train_years + self.val_years]
+                test_yr = years[i + self.train_years + self.val_years : i + total_span]
+
+                train_raw = [d for d in all_dates if pd.to_datetime(d).year in train_yrs]
+                val_raw = [d for d in all_dates if pd.to_datetime(d).year in val_yr]
+                test_raw = [d for d in all_dates if pd.to_datetime(d).year in test_yr]
+
+                # Purge: Train 末尾去除 horizon 天
+                purged_train = train_raw[:-self.horizon] if len(train_raw) > self.horizon else train_raw
+                # Embargo: Val 前端跳过 embargo_days，末尾去除 horizon
+                purged_val = val_raw[self.embargo_days : -self.horizon] if len(val_raw) > (self.embargo_days + self.horizon) else val_raw
+                # Test 前端跳过 embargo_days
+                purged_test = test_raw[self.embargo_days :] if len(test_raw) > self.embargo_days else test_raw
+
+                if purged_train and purged_val and purged_test:
+                    folds.append({
+                        "fold_id": len(folds) + 1,
+                        "train_dates": purged_train,
+                        "val_dates": purged_val,
+                        "test_dates": purged_test,
+                        "train_years": train_yrs,
+                        "val_years": val_yr,
+                        "test_years": test_yr,
+                    })
+
+        if not folds:
+            raise InsufficientWalkForwardHistoryError(
+                f"Insufficient history for Purged Walk-Forward: calendar has {len(years)} year(s) "
+                f"({years[0] if years else 'n/a'}..{years[-1] if years else 'n/a'}, {len(all_dates)} dates), "
+                f"but the configured experiment requires train_years={self.train_years} + "
+                f"val_years={self.val_years} + test_years={self.test_years} "
+                f"(= {total_span} consecutive years). Refusing to degrade the experiment definition."
+            )
+
+        return folds
 
     def run_purged_walk_forward(
         self,
         df_all: pd.DataFrame,
         feature_cols: List[str],
-        label_col: str = "rank_label_5d"
-    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        label_col: str = "rank_label_5d",
+        model_type: Optional[str] = None
+    ) -> Tuple[pd.DataFrame, Dict[str, Any], pd.DataFrame]:
         """
-        进行带有 Purge 剔除隔离的 Walk-Forward 交叉验证
+        运行完整的 Purged Walk Forward 交叉验证
+        返回: (fold_metrics_df, summary_dict, oos_predictions_df)
         """
         if df_all.empty:
-            return pd.DataFrame(), {}
-            
-        df = df_all.copy()
-        dates = sorted(df["trade_date"].unique())
-        
-        # 扣除初始 60 天因子 warmup 积累期
-        warmup_offset = 60 if len(dates) > 75 else 0
-        usable_dates = dates[warmup_offset:]
-        n = len(usable_dates)
-        
-        train_end_idx = int(n * 0.5)
-        val_end_idx = int(n * 0.75)
-        
-        # ---  aplicar Purge 规则 ---
-        # 1. Train 集合: 去掉 Train 末尾 5 天 (horizon)，防止 Train 标签跨界进入 Validation
-        purged_train_dates = usable_dates[:max(0, train_end_idx - self.horizon)]
-        
-        # 2. Validation 集合: 从 train_end_idx + embargo_days 开始
-        val_start_idx = min(train_end_idx + self.embargo_days, n - 1)
-        purged_val_dates = usable_dates[val_start_idx:max(val_start_idx, val_end_idx - self.horizon)]
-        
-        # 3. Test 集合: 从 val_end_idx + embargo_days 开始
-        test_start_idx = min(val_end_idx + self.embargo_days, n - 1)
-        test_dates = usable_dates[test_start_idx:]
-        
-        logger.info(f"Purged Split generated | Train days: {len(purged_train_dates)} | Val days: {len(purged_val_dates)} | Test days: {len(test_dates)}")
-        
-        train_df = df[df["trade_date"].isin(purged_train_dates)]
-        val_df = df[df["trade_date"].isin(purged_val_dates)]
-        test_df = df[df["trade_date"].isin(test_dates)].copy()
-        
-        # 训练 Qlib 模型
-        model = QlibLGBMModelAdapter(feature_cols=feature_cols)
-        model.fit(train_df, val_df)
-        
-        # 测试集单次预测
-        test_df["lgbm_score"] = model.predict(test_df)
-        
-        # 评估测试集 RankIC
-        ic_df = compute_daily_ic(test_df, score_col="lgbm_score", label_col=label_col)
-        ic_stats = compute_ic_stats(ic_df)
-        
-        fold_results = [{
-            "fold": 1,
-            "train_days": len(purged_train_dates),
-            "val_days": len(purged_val_dates),
-            "test_days": len(test_dates),
-            "mean_ic": ic_stats["mean_ic"],
-            "icir": ic_stats["icir"],
-            "pos_ratio": ic_stats["pos_ratio"]
-        }]
-        
-        fold_metrics_df = pd.DataFrame(fold_results)
-        return fold_metrics_df, ic_stats
+            raise InsufficientWalkForwardHistoryError("Input DataFrame is empty: cannot run walk-forward.")
+
+        m_type = model_type or self.config.get("model", {}).get("type", "sklearn_hgb")
+        all_dates = sorted(pd.to_datetime(df_all["trade_date"]).dt.strftime("%Y-%m-%d").unique())
+        folds = self.generate_folds(all_dates)
+
+        logger.info(f"Generated {len(folds)} Purged Walk-Forward folds. Model Type: '{m_type}'.")
+        logger.info(f"Walk-Forward config: {self.walk_forward_config()}")
+
+        fold_records = []
+        all_oos_preds = []
+
+        for fold in folds:
+            f_id = fold["fold_id"]
+            train_dates = fold["train_dates"]
+            val_dates = fold["val_dates"]
+            test_dates = fold["test_dates"]
+
+            # 严格时序隔离校验
+            max_train_date = max(train_dates)
+            min_val_date = min(val_dates)
+            max_val_date = max(val_dates)
+            min_test_date = min(test_dates)
+
+            t_idx = all_dates.index(max_train_date)
+            v_idx = all_dates.index(min_val_date)
+            v_end_idx = all_dates.index(max_val_date)
+            test_idx = all_dates.index(min_test_date)
+
+            # P1-5: 验证 train -> valid 与 valid -> test 时序隔离边界，不满足则 Fail Loudly
+            if v_idx - t_idx < self.horizon:
+                raise LeakageBoundaryError(
+                    f"Leakage Boundary Error on Fold {f_id}: Train-Val gap ({v_idx - t_idx} days) "
+                    f"< horizon ({self.horizon} days). Max train: {max_train_date}, Min val: {min_val_date}."
+                )
+
+            if test_idx - v_end_idx < self.horizon:
+                raise LeakageBoundaryError(
+                    f"Leakage Boundary Error on Fold {f_id}: Val-Test gap ({test_idx - v_end_idx} days) "
+                    f"< horizon ({self.horizon} days). Max val: {max_val_date}, Min test: {min_test_date}."
+                )
+
+            train_df = df_all[df_all["trade_date"].isin(train_dates)]
+            val_df = df_all[df_all["trade_date"].isin(val_dates)]
+            test_df = df_all[df_all["trade_date"].isin(test_dates)].copy()
+
+            model = create_model_by_type(m_type, feature_cols=feature_cols, config=self.config)
+            model.fit(train_df, val_df)
+
+            test_scores = model.predict(test_df)
+            test_df["score"] = test_scores
+            test_df["fold_id"] = f_id
+            test_df["train_end_date"] = max_train_date
+
+            # 校验 OOS 属性：测试日期严格晚于模型训练截止日期
+            test_dates_set = set(test_df["trade_date"])
+            train_dates_set = set(train_dates)
+            leak_dates = test_dates_set.intersection(train_dates_set)
+            if leak_dates:
+                raise LeakageBoundaryError(f"Fold {f_id} test dates overlap with train dates: {leak_dates}")
+
+            fold_oos = test_df[["trade_date", "ts_code", "score", label_col, "fold_id", "train_end_date"]].rename(columns={label_col: "label"}).copy()
+            all_oos_preds.append(fold_oos)
+
+            ic_df = compute_daily_ic(test_df, score_col="score", label_col=label_col)
+            ic_stats = compute_ic_stats(ic_df)
+
+            fold_records.append({
+                "fold_id": f_id,
+                "train_days": len(train_dates),
+                "val_days": len(val_dates),
+                "test_days": len(test_dates),
+                "train_end_date": max_train_date,
+                "test_start_date": min_test_date,
+                "test_end_date": max(test_dates),
+                "mean_ic": ic_stats["mean_ic"],
+                "icir": ic_stats["icir"],
+                "pos_ratio": ic_stats["pos_ratio"],
+                "model_class": model.__class__.__name__
+            })
+
+        fold_df = pd.DataFrame(fold_records)
+        oos_predictions_df = pd.concat(all_oos_preds, ignore_index=True)
+
+        overall_ic = compute_daily_ic(oos_predictions_df, score_col="score", label_col="label")
+        summary = compute_ic_stats(overall_ic)
+        summary["num_folds"] = len(folds)
+        summary["model_type"] = m_type
+
+        return fold_df, summary, oos_predictions_df
