@@ -428,11 +428,23 @@ def update_qlib_data(qlib_repo, target_dir, region):
 
         # 验证更新后的数据健康度
         status = get_qlib_provider_status(provider_uri=target)
-        if status["status"] in ("READY", "STALE"):
-            click.echo(f"\n[SUCCESS] Qlib provider data updated successfully. Status: {status['status']}")
+        if status["status"] == "READY":
+            click.echo(f"\n[SUCCESS] Qlib provider data updated successfully. Status: READY")
             sys.exit(0)
+        elif status["status"] == "STALE":
+            click.echo(
+                f"\n[ERROR] Qlib provider update completed but data is STALE:\n"
+                f"  Provider Calendar End: {status.get('calendar_end', 'N/A')}\n"
+                f"  Expected Latest Completed Market Date: {status.get('expected_latest_market_date', 'N/A')}\n"
+                f"  Details: {status.get('status_message', '')}",
+                err=True,
+            )
+            sys.exit(1)
         else:
-            click.echo(f"\n[ERROR] Qlib provider update completed but status check failed: {status['status_message']}", err=True)
+            click.echo(
+                f"\n[ERROR] Qlib provider update completed but status check failed ({status['status']}): {status.get('status_message', '')}",
+                err=True,
+            )
             sys.exit(1)
     else:
         click.echo("\n=======================================================")
@@ -444,7 +456,7 @@ def update_qlib_data(qlib_repo, target_dir, region):
         click.echo(f"1. Download official CN dataset:")
         click.echo(f"   python scripts/get_data.py qlib_data --target_dir {target} --region {region}")
         click.echo(f"\n2. Dump preprocessed CSV into Qlib binary format:")
-        click.echo(f"   python scripts/dump_bin.py dump_all --csv_path data/qlib_csv --qlib_dir {target} --include_fields open,high,low,close,volume,factor")
+        click.echo(f"   python scripts/dump_bin.py dump_all --data_path data/qlib_csv --qlib_dir {target} --include_fields open,high,low,close,volume,factor")
         click.echo("=======================================================\n")
         sys.exit(1)
 

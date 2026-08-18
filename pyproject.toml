@@ -29,6 +29,7 @@ dependencies = [
     "pyqlib>=0.9.7",
     "tables>=3.9.0",
     "cvxpy>=1.4.0",
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

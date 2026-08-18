@@ -62,20 +62,19 @@ class DataFetcher:
 
     def fetch_trade_calendar(self, start_date: str = "20180101", end_date: Optional[str] = None) -> pd.DataFrame:
         """
-        获取 A 股交易日历
+        获取 A 股交易日历 (包含真实交易日列表，由交易所/数据源官方发布)
         """
-        if end_date is None:
-            end_date = datetime.now().strftime("%Y%m%d")
-        
-        start_date_clean = start_date.replace("-", "")
-        end_date_clean = end_date.replace("-", "")
-        
-        logger.info(f"Fetching trade calendar from {start_date_clean} to {end_date_clean}...")
+        start_date_clean = start_date.replace("-", "") if start_date else ""
+        end_date_clean = end_date.replace("-", "") if end_date else ""
+
+        logger.info(f"Fetching trade calendar from {start_date_clean or 'start'} to {end_date_clean or 'latest'}...")
         try:
             df = ak.tool_trade_date_hist_sina()
             df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
-            df = df[(df["trade_date"] >= pd.to_datetime(start_date_clean).strftime("%Y-%m-%d")) & 
-                    (df["trade_date"] <= pd.to_datetime(end_date_clean).strftime("%Y-%m-%d"))]
+            if start_date_clean:
+                df = df[df["trade_date"] >= pd.to_datetime(start_date_clean).strftime("%Y-%m-%d")]
+            if end_date_clean:
+                df = df[df["trade_date"] <= pd.to_datetime(end_date_clean).strftime("%Y-%m-%d")]
             df = df.sort_values("trade_date").reset_index(drop=True)
             return df
         except Exception as e:

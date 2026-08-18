@@ -40,7 +40,9 @@ def get_expected_latest_completed_trade_date(reference_time: Optional[datetime] 
     严格使用 Asia/Shanghai 时区。
     若未过 15:30，预期为上一个交易日；若已过 15:30，预期为当日（若当日为交易日）或此前最近一个交易日。
     禁止使用 pandas BDay 猜测（无法识别中国法定节假日）。
-    若本地 cached trade_calendar 未覆盖当前日期，且无可用实时日历数据源，抛出 MarketCalendarUnavailableError。
+    若本地 cached trade_calendar 未覆盖当前日期附近的真实交易日 schedule，
+    且无法从可靠日历数据源拉取到证明覆盖当前日期的真实日历（即包含当前日期之后的已知交易日），
+    抛出 MarketCalendarUnavailableError。
     """
     shanghai_tz = ZoneInfo("Asia/Shanghai")
     if reference_time is None:
@@ -66,50 +68,63 @@ def get_expected_latest_completed_trade_date(reference_time: Optional[datetime] 
     except Exception:
         pass
 
-    cal_coverage_end = None
-    if df_cal is not None and not df_cal.empty and "trade_date" in df_cal.columns:
-        cal_coverage_end = str(df_cal["trade_date"].max())
+    def extract_open_dates(df: Optional[pd.DataFrame]) -> List[str]:
+        if df is None or df.empty or "trade_date" not in df.columns:
+            return []
+        if "is_open" in df.columns:
+            valid = df[(df["is_open"] == 1) | (df["is_open"] == True) | (df["is_open"] == "1")]
+            return sorted([str(d) for d in valid["trade_date"].dropna().unique()])
+        return sorted([str(d) for d in df["trade_date"].dropna().unique()])
 
-    # 若本地日历未覆盖 today，尝试从 DataFetcher 动态拉取日历
-    if cal_coverage_end is None or cal_coverage_end < today_str:
+    open_dates = extract_open_dates(df_cal)
+    has_future_dates = any(d > today_str for d in open_dates)
+
+    # 若本地日历无法证明覆盖 today，尝试从 DataFetcher 动态拉取前后窗口 (today - 45d ~ today + 45d)
+    if not has_future_dates:
         try:
             from ashare_quant.data.fetcher import DataFetcher
             fetcher = DataFetcher()
-            fresh_cal = fetcher.fetch_trade_calendar(start_date="2000-01-01", end_date=today_str)
-            if fresh_cal is not None and not fresh_cal.empty and "trade_date" in fresh_cal.columns:
-                if str(fresh_cal["trade_date"].max()) >= today_str:
-                    df_cal = fresh_cal
-                    cal_coverage_end = str(df_cal["trade_date"].max())
+            start_window = (now - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+            end_window = (now + pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+            fresh_cal = fetcher.fetch_trade_calendar(start_date=start_window, end_date=end_window)
+            fresh_open_dates = extract_open_dates(fresh_cal)
+            if any(d > today_str for d in fresh_open_dates):
+                open_dates = fresh_open_dates
+                has_future_dates = True
         except Exception:
             pass
 
     # 严格检验日历覆盖范围：禁止猜测交易日
-    if df_cal is None or df_cal.empty or cal_coverage_end is None or cal_coverage_end < today_str:
+    if not open_dates or not has_future_dates:
+        cal_max = max(open_dates) if open_dates else "None"
         raise MarketCalendarUnavailableError(
             f"MarketCalendarUnavailableError: Reliable trading calendar covering current date '{today_str}' is unavailable. "
-            f"Cached calendar ends at '{cal_coverage_end or 'None'}'. Guessing trade dates via weekday/BDay is forbidden."
+            f"Calendar maximum known trading date is '{cal_max}', which does not contain future trading dates beyond '{today_str}'. "
+            f"Guessing trade dates via weekday/BDay is forbidden."
         )
 
-    # 过滤开市交易日
-    if "is_open" in df_cal.columns:
-        open_cal = df_cal[(df_cal["is_open"] == 1) | (df_cal["is_open"] == True) | (df_cal["is_open"] == "1")]
+    # 计算预期最新已完成交易日
+    past_dates = [d for d in open_dates if d < today_str]
+
+    if not is_after_market_close:
+        # 当前时间 < 15:30: expected_date = 最大 trading_date < today
+        if not past_dates:
+            raise MarketCalendarUnavailableError(
+                f"MarketCalendarUnavailableError: No completed trading dates found before '{today_str}' in market calendar."
+            )
+        return past_dates[-1]
     else:
-        open_cal = df_cal
-
-    open_dates = [str(d) for d in open_cal["trade_date"].dropna().unique()]
-    open_dates = sorted(open_dates)
-
-    if is_after_market_close:
-        valid_dates = [d for d in open_dates if d <= today_str]
-    else:
-        valid_dates = [d for d in open_dates if d < today_str]
-
-    if not valid_dates:
-        raise MarketCalendarUnavailableError(
-            f"MarketCalendarUnavailableError: No completed trading dates found before or on '{today_str}' in market calendar."
-        )
-
-    return str(valid_dates[-1])
+        # 当前时间 >= 15:30:
+        # 如果 today 是 trading day: expected_date = today
+        # 否则: expected_date = 最大 trading_date < today
+        if today_str in open_dates:
+            return today_str
+        else:
+            if not past_dates:
+                raise MarketCalendarUnavailableError(
+                    f"MarketCalendarUnavailableError: No completed trading dates found before '{today_str}' in market calendar."
+                )
+            return past_dates[-1]
 
 def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, Any]:
     """

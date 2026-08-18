@@ -472,6 +472,15 @@ def test_daily_signal_rejects_stale_provider_without_explicit_date():
         assert "2026-08-18" in str(excinfo.value)
 
 
+def test_shanghai_timezone_instantiation():
+    """
+    验证 ZoneInfo('Asia/Shanghai') 在各平台（含 Windows 与 tzdata）下能成功实例化
+    """
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Asia/Shanghai")
+    assert tz.key == "Asia/Shanghai"
+
+
 def test_freshness_check_with_stale_calendar_raises():
     """
     验证当 cached trade calendar 过期 (如只到 2020 而 today=2026) 时，抛出 MarketCalendarUnavailableError，绝不猜测
@@ -479,8 +488,8 @@ def test_freshness_check_with_stale_calendar_raises():
     from ashare_quant.data.qlib_exporter import get_expected_latest_completed_trade_date, MarketCalendarUnavailableError
     from unittest.mock import patch
 
-    # 模拟本地日历只到 2020-12-31，today 为 2026-08-18
-    mock_cal_df = pd.DataFrame({"trade_date": ["2020-01-02", "2020-12-31"], "is_open": [1, 1]})
+    # 模拟本地日历只到 2020-12-31，today 为 2026-08-18 (生产 schema: trade_date list)
+    mock_cal_df = pd.DataFrame({"trade_date": ["2020-01-02", "2020-12-31"]})
     with patch("ashare_quant.data.storage.StorageEngine.load_parquet", return_value=mock_cal_df):
         with patch("ashare_quant.data.fetcher.DataFetcher.fetch_trade_calendar", side_effect=Exception("No network")):
             with pytest.raises(MarketCalendarUnavailableError, match="Reliable trading calendar"):
@@ -490,19 +499,76 @@ def test_freshness_check_with_stale_calendar_raises():
 def test_freshness_holiday_spring_festival_accurate():
     """
     验证使用中国法定节假日日历时，春节等假期准确回溯至上一有效交易日，不使用简单 weekday / BDay
+    使用与生产 DataFetcher 相同 schema (trade_date list)
     """
     from ashare_quant.data.qlib_exporter import get_expected_latest_completed_trade_date
     from unittest.mock import patch
 
-    # 模拟真实日历: 2026-02-13 (周五) 为交易日，2026-02-14 至 2026-02-22 为春节休市 (is_open=0)
+    # 模拟真实日历: 2026-02-13 (周五) 为节前最后交易日，2026-02-23 为节后首个交易日
     mock_cal_df = pd.DataFrame({
-        "trade_date": ["2026-02-13", "2026-02-16", "2026-02-17", "2026-02-23"],
-        "is_open": [1, 0, 0, 1]
+        "trade_date": ["2026-02-13", "2026-02-23", "2026-03-01"]
     })
     with patch("ashare_quant.data.storage.StorageEngine.load_parquet", return_value=mock_cal_df):
         # 在春节假期中的周二 2026-02-17 16:00 查询，最新已完成交易日必须是 2026-02-13，绝不能是 2026-02-17 或 2026-02-16 (BDay)
         latest_date = get_expected_latest_completed_trade_date(reference_time=datetime(2026, 2, 17, 16, 0, 0))
         assert latest_date == "2026-02-13"
+
+
+def test_freshness_national_day_holiday_accurate():
+    """
+    验证国庆节假期准确回溯至 9 月最后一个交易日 (如 2026-09-30)
+    """
+    from ashare_quant.data.qlib_exporter import get_expected_latest_completed_trade_date
+    from unittest.mock import patch
+
+    mock_cal_df = pd.DataFrame({
+        "trade_date": ["2026-09-30", "2026-10-08", "2026-10-09"]
+    })
+    with patch("ashare_quant.data.storage.StorageEngine.load_parquet", return_value=mock_cal_df):
+        latest_date = get_expected_latest_completed_trade_date(reference_time=datetime(2026, 10, 3, 16, 0, 0))
+        assert latest_date == "2026-09-30"
+
+
+def test_freshness_weekend_saturday_and_sunday():
+    """
+    验证周六和周日准确回溯至周五交易日，无论在 15:30 之前或之后
+    """
+    from ashare_quant.data.qlib_exporter import get_expected_latest_completed_trade_date
+    from unittest.mock import patch
+
+    mock_cal_df = pd.DataFrame({
+        "trade_date": ["2026-08-21", "2026-08-24", "2026-08-25"]
+    })
+    with patch("ashare_quant.data.storage.StorageEngine.load_parquet", return_value=mock_cal_df):
+        # 周六 10:00
+        assert get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 22, 10, 0, 0)) == "2026-08-21"
+        # 周六 16:00
+        assert get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 22, 16, 0, 0)) == "2026-08-21"
+        # 周日 10:00
+        assert get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 23, 10, 0, 0)) == "2026-08-21"
+        # 周日 16:00
+        assert get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 23, 16, 0, 0)) == "2026-08-21"
+
+
+def test_freshness_trading_day_before_and_after_cutoff():
+    """
+    验证普通交易日 15:30 之前取前一交易日，15:30 及之后取当日
+    """
+    from ashare_quant.data.qlib_exporter import get_expected_latest_completed_trade_date
+    from unittest.mock import patch
+
+    mock_cal_df = pd.DataFrame({
+        "trade_date": ["2026-08-18", "2026-08-19", "2026-08-20"]
+    })
+    with patch("ashare_quant.data.storage.StorageEngine.load_parquet", return_value=mock_cal_df):
+        # 交易日 10:00 (< 15:30) -> 前一交易日 2026-08-18
+        assert get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 19, 10, 0, 0)) == "2026-08-18"
+        # 交易日 15:29:59 (< 15:30) -> 前一交易日 2026-08-18
+        assert get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 19, 15, 29, 59)) == "2026-08-18"
+        # 交易日 15:30:00 (>= 15:30) -> 当日 2026-08-19
+        assert get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 19, 15, 30, 0)) == "2026-08-19"
+        # 交易日 16:00:00 (>= 15:30) -> 当日 2026-08-19
+        assert get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 19, 16, 0, 0)) == "2026-08-19"
 
 
 def test_missing_factor_never_falls_back_to_one():
@@ -731,7 +797,7 @@ def test_qlib_status_factor_coverage():
 
 def test_update_qlib_data_cli_exit_code():
     """
-    P0-3: 验证未配置自动更新时，update-qlib-data 命令明确 exit 1 并输出指引
+    P0-3: 验证未配置自动更新时，update-qlib-data 命令明确 exit 1 并输出指引 (含 --data_path 且无 --csv_path)
     """
     from click.testing import CliRunner
     from ashare_quant.cli import cli
@@ -742,6 +808,75 @@ def test_update_qlib_data_cli_exit_code():
     assert "AUTOMATIC UPDATE NOT CONFIGURED" in res.output
     assert "scripts/get_data.py" in res.output
     assert "scripts/dump_bin.py" in res.output
+    assert "--data_path" in res.output
+    assert "--csv_path" not in res.output
+
+
+def test_update_qlib_data_stale_is_failure():
+    """
+    验证执行 update-qlib-data 后若 status 为 STALE，必须 exit non-zero 且不得出现 [SUCCESS]，并输出 provider calendar end 和 expected market date
+    """
+    from click.testing import CliRunner
+    from ashare_quant.cli import cli
+    import tempfile
+    from unittest.mock import patch, MagicMock
+
+    runner = CliRunner()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_repo = Path(tmpdir) / "qlib"
+        scripts_dir = tmp_repo / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "get_data.py").write_text("# mock", encoding="utf-8")
+        (scripts_dir / "dump_bin.py").write_text("# mock", encoding="utf-8")
+
+        mock_sub = MagicMock(returncode=0)
+        mock_status = {
+            "status": "STALE",
+            "calendar_end": "2021-06-11",
+            "expected_latest_market_date": "2026-08-18",
+            "status_message": "Provider data ends at '2021-06-11', older than expected market date '2026-08-18'."
+        }
+
+        with patch("subprocess.run", return_value=mock_sub):
+            with patch("ashare_quant.data.qlib_exporter.get_qlib_provider_status", return_value=mock_status):
+                res = runner.invoke(cli, ["update-qlib-data", "--qlib-repo", str(tmp_repo)])
+                assert res.exit_code != 0
+                assert "[SUCCESS]" not in res.output
+                assert "STALE" in res.output
+                assert "2021-06-11" in res.output
+                assert "2026-08-18" in res.output
+
+
+def test_update_qlib_data_ready_is_success():
+    """
+    验证执行 update-qlib-data 后仅当 status 为 READY 时才能 exit 0 并输出 [SUCCESS]
+    """
+    from click.testing import CliRunner
+    from ashare_quant.cli import cli
+    import tempfile
+    from unittest.mock import patch, MagicMock
+
+    runner = CliRunner()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_repo = Path(tmpdir) / "qlib"
+        scripts_dir = tmp_repo / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "get_data.py").write_text("# mock", encoding="utf-8")
+        (scripts_dir / "dump_bin.py").write_text("# mock", encoding="utf-8")
+
+        mock_sub = MagicMock(returncode=0)
+        mock_status = {
+            "status": "READY",
+            "calendar_end": "2026-08-18",
+            "expected_latest_market_date": "2026-08-18",
+            "status_message": "Provider data is complete and fully up-to-date."
+        }
+
+        with patch("subprocess.run", return_value=mock_sub):
+            with patch("ashare_quant.data.qlib_exporter.get_qlib_provider_status", return_value=mock_status):
+                res = runner.invoke(cli, ["update-qlib-data", "--qlib-repo", str(tmp_repo)])
+                assert res.exit_code == 0
+                assert "[SUCCESS]" in res.output
 
 
 # ======================= Integration Tests =======================
