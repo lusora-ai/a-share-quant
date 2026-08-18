@@ -79,44 +79,50 @@ def train(feature_set, model, config):
         provider_uri = QlibDataProviderManager.init_qlib()
 
         cal_file = Path(provider_uri) / "calendars" / "day.txt"
-        calendar_dates = [line.strip() for line in cal_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        provider_calendar_dates = [line.strip() for line in cal_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        provider_data_end_date = provider_calendar_dates[-1]
 
+        # 分离 Research Calendar (受 walk_forward.start_year/end_year 限制) 和 Production Calendar (完整真实 provider calendar)
         start_year = wf_cfg.get("start_year")
         end_year = wf_cfg.get("end_year")
+        research_calendar_dates = provider_calendar_dates
         if start_year is not None:
-            calendar_dates = [d for d in calendar_dates if int(d[:4]) >= int(start_year)]
+            research_calendar_dates = [d for d in research_calendar_dates if int(d[:4]) >= int(start_year)]
         if end_year is not None:
-            calendar_dates = [d for d in calendar_dates if int(d[:4]) <= int(end_year)]
+            research_calendar_dates = [d for d in research_calendar_dates if int(d[:4]) <= int(end_year)]
 
-        data_end_date = calendar_dates[-1]
+        research_start_date = research_calendar_dates[0]
+        research_end_date = research_calendar_dates[-1]
 
         # 实例化官方 Alpha158（显式注入项目 5D executable label）
         from ashare_quant.features.qlib_alpha158 import OfficialQlibAlpha158
         from ashare_quant.validation.qlib_walk_forward import QlibWalkForwardEvaluator
         from qlib.data.dataset import DatasetH
 
+        # Handler 使用完整 Provider Calendar 创建 (保障特征计算与生产模型完整历史可用)
         alpha_adapter = OfficialQlibAlpha158()
         handler = alpha_adapter.create_handler_instance(
             instruments="csi300",
-            start_time=calendar_dates[0],
-            end_time=calendar_dates[-1]
+            start_time=provider_calendar_dates[0],
+            end_time=provider_calendar_dates[-1]
         )
 
-        # 运行 Qlib Purged Walk-Forward (参数来自 config，不硬编码)
+        # 运行 Qlib Purged Walk-Forward (严格限制在 research_calendar_dates 历史区间)
         evaluator = QlibWalkForwardEvaluator(horizon=horizon, config=cfg)
-        fold_df, summary, oos_preds_df = evaluator.run_qlib_walk_forward(handler, calendar_dates)
+        fold_df, summary, oos_preds_df = evaluator.run_qlib_walk_forward(handler, research_calendar_dates)
 
-        # 5D future label: data_end - horizon = label_mature_end
-        label_mature_end_date = calendar_dates[-(horizon + 1)] if len(calendar_dates) > horizon else calendar_dates[-1]
-        production_train_end_date = label_mature_end_date
+        # Production Model 使用完整 provider_calendar_dates: production_train_end_date = provider_data_end - horizon
+        production_train_end_date = provider_calendar_dates[-(horizon + 1)] if len(provider_calendar_dates) > horizon else provider_calendar_dates[-1]
+        label_mature_end_date = production_train_end_date
+        data_end_date = provider_data_end_date
+        train_end_date = production_train_end_date
 
-        # 训练全量生产模型 (仅用于未来 Daily Signal)
-        prod_dataset = DatasetH(handler=handler, segments={"train": (calendar_dates[0], production_train_end_date)})
+        # 训练全量生产模型 (仅用于未来 Daily Signal，数据覆盖至最新成熟标签日)
+        prod_dataset = DatasetH(handler=handler, segments={"train": (provider_calendar_dates[0], production_train_end_date)})
         prod_model = OfficialQlibLGBMModel(config=cfg)
         prod_model.fit(prod_dataset)
         imp_df = prod_model.get_feature_importance()
         feature_cols = OfficialQlibAlpha158.get_feature_names()
-        train_end_date = production_train_end_date
 
         label_spec = build_exec_label_5d_spec()
         walk_forward_meta = evaluator.walk_forward_config()
@@ -126,9 +132,10 @@ def train(feature_set, model, config):
         if model == "qlib_lgbm":
             raise ValueError("Feature set 'custom12' does not support 'qlib_lgbm'. Use 'native_lgbm' or 'sklearn_hgb'.")
 
-        # 1. 加载真实行情
+        # 1. 加载真实行情与 master
         processor = DataProcessor()
         try:
+            df_master = processor.storage.load_parquet("stock_master", is_processed=True)
             df_daily = processor.storage.load_parquet("daily_ohlcv", is_processed=True)
         finally:
             processor.close()
@@ -136,9 +143,9 @@ def train(feature_set, model, config):
         if df_daily is None or df_daily.empty:
             raise RuntimeError("ERROR: Daily market data missing. Please run 'ashare-quant update-data' first.")
 
-        # 2. 共享 universe（train / walk-forward / daily 全部复用同一个定义）
+        # 2. 共享 universe（train / walk-forward / daily 全部复用同一个定义，均传入 master_df）
         from ashare_quant.features.custom12 import FACTOR_NAMES_12
-        df_universe = build_custom12_universe(df_daily)
+        df_universe = build_custom12_universe(df_daily, master_df=df_master)
 
         f_engine = Custom12Factors()
         df_factors = f_engine.compute(df_universe)
@@ -148,21 +155,39 @@ def train(feature_set, model, config):
         feature_cols = FACTOR_NAMES_12.copy()
         assert set(feature_cols).issubset(df_all.columns), f"Missing custom12 features: {set(feature_cols) - set(df_all.columns)}"
 
-        # 3. 运行 Purged Walk-Forward 评估 (参数来自 config)
+        all_dates = sorted(df_all["trade_date"].unique())
+        provider_data_end_date = all_dates[-1]
+
+        start_year = wf_cfg.get("start_year")
+        end_year = wf_cfg.get("end_year")
+        if start_year is not None or end_year is not None:
+            research_df = df_all[df_all["trade_date"].apply(
+                lambda d: (start_year is None or int(d[:4]) >= int(start_year)) and (end_year is None or int(d[:4]) <= int(end_year))
+            )].copy()
+        else:
+            research_df = df_all
+
+        research_dates = sorted(research_df["trade_date"].unique())
+        research_start_date = research_dates[0]
+        research_end_date = research_dates[-1]
+
+        # 3. 运行 Purged Walk-Forward 评估 (严格限制在 research_df 历史区间)
         evaluator = PurgedWalkForwardEvaluator(horizon=horizon, config=cfg)
         fold_df, summary, oos_preds_df = evaluator.run_purged_walk_forward(
-            df_all,
+            research_df,
             feature_cols=feature_cols,
             model_type="sklearn_hgb" if model == "sklearn_hgb" else "native_lgbm"
         )
 
-        # 4. 训练全量生产模型 (仅用于未来 Daily Signal)
-        prod_model = SklearnHGBModel(config=cfg, feature_cols=feature_cols) if model == "sklearn_hgb" else NativeLGBMModel(config=cfg, feature_cols=feature_cols)
-        imp_df = prod_model.fit(df_all)
-        data_end_date = str(df_all["trade_date"].max())
-        label_mature_end_date = str(sorted(df_all["trade_date"].unique())[-(horizon + 1)])
-        production_train_end_date = label_mature_end_date
+        # 4. 训练全量生产模型 (使用全部 df_all，截止到 production_train_end_date)
+        production_train_end_date = str(all_dates[-(horizon + 1)] if len(all_dates) > horizon else all_dates[-1])
+        label_mature_end_date = production_train_end_date
+        data_end_date = provider_data_end_date
         train_end_date = production_train_end_date
+
+        train_prod_df = df_all[df_all["trade_date"] <= production_train_end_date]
+        prod_model = SklearnHGBModel(config=cfg, feature_cols=feature_cols) if model == "sklearn_hgb" else NativeLGBMModel(config=cfg, feature_cols=feature_cols)
+        imp_df = prod_model.fit(train_prod_df)
         provider_uri = ""
 
         label_spec = {
@@ -182,7 +207,7 @@ def train(feature_set, model, config):
     else:
         raise ValueError(f"Unknown feature set '{feature_set}'. Allowed: 'alpha158', 'custom12'.")
 
-    # 5. 实验归档 (完整元数据)
+    # 5. 实验归档 (完整元数据，分开记录 research 和 production 日期)
     exp_id = tracker.create_experiment(
         name=f"{feature_set}_{model}",
         config=cfg,
@@ -192,6 +217,9 @@ def train(feature_set, model, config):
         label_spec=label_spec,
         walk_forward_config=walk_forward_meta,
         universe=universe_meta,
+        research_start_date=research_start_date,
+        research_end_date=research_end_date,
+        provider_data_end_date=provider_data_end_date,
         train_end_date=train_end_date,
         data_end_date=data_end_date,
         label_mature_end_date=label_mature_end_date,
@@ -219,14 +247,15 @@ def train(feature_set, model, config):
     click.echo(f"Folds Count: {len(fold_df)} | Total OOS Predictions: {len(oos_preds_df)}")
     click.echo(f"Mean IC: {summary.get('mean_ic', 0.0):.4f} | ICIR: {summary.get('icir', 0.0):.4f} | Pos Ratio: {summary.get('pos_ratio', 0.0):.2%}")
     click.echo(f"Walk-Forward Config: {walk_forward_meta}")
-    click.echo(f"Data End: {data_end_date} | Label Mature End: {label_mature_end_date} | Train End: {production_train_end_date}")
+    click.echo(f"Research Dates     : {research_start_date} -> {research_end_date}")
+    click.echo(f"Provider Data End  : {provider_data_end_date} | Production Train End: {production_train_end_date}")
     click.echo(f"=======================================================\n")
 
 @cli.command("backtest")
 @click.option("--experiment", required=True, help="实验 ID (experiment_id)")
 @click.option("--config", default="configs/backtest.yaml", help="回测配置文件")
 def backtest(experiment, config):
-    """执行基于 Qlib 引擎与 A 股真实成交约束（T+1/涨跌停/停牌/滑点）的策略回测 (只允许使用 OOS Predictions)"""
+    """执行基于 Qlib 引擎与 A 股真实成交约束（T+1/涨跌停/停牌/滑点）的策略回测 (严格检验 OOS Predictions 内容)"""
     logger.info(f"开始 Qlib 真实策略回测 | 实验ID: {experiment}")
 
     exp_dir = Path("experiments") / experiment
@@ -246,6 +275,12 @@ def backtest(experiment, config):
     if oos_preds_df.empty or "score" not in oos_preds_df.columns:
         raise RuntimeError("ERROR: OOS predictions file is empty or missing 'score'.")
 
+    # 严格检验 OOS 预测集内容 (trade_date > train_end_date, 范围与 fold_metrics 一致)
+    fold_metrics_path = exp_dir / "fold_metrics.parquet"
+    fold_metrics_df = pd.read_parquet(fold_metrics_path) if fold_metrics_path.exists() else None
+    engine = QlibEngineAdapter()
+    engine.validate_oos_predictions(oos_preds_df, fold_metrics_df=fold_metrics_df)
+
     # 读取实验元数据
     meta_path = exp_dir / "metadata.json"
     feature_set = "alpha158"
@@ -253,8 +288,6 @@ def backtest(experiment, config):
         with open(meta_path, "r", encoding="utf-8") as f:
             metadata = json.load(f)
             feature_set = metadata.get("feature_set", "alpha158")
-
-    engine = QlibEngineAdapter()
 
     if feature_set == "alpha158":
         # Qlib Canonical 回测
@@ -310,11 +343,18 @@ def daily_signal(date):
     pipeline = DailySignalPipeline()
     res = pipeline.run_daily_pipeline(target_date=date)
     click.echo(f"\n=======================================================")
-    click.echo(f"真实每日选股信号计算完成。计算日期: {res.get('trade_date')} | 候选股票数量: {res.get('candidates_count', 0)}")
+    click.echo(f"真实每日选股信号计算完成。")
+    click.echo(f"Signal Date         : {res.get('signal_date')}")
+    click.echo(f"Provider Data End   : {res.get('provider_data_end')}")
+    click.echo(f"Production Train End: {res.get('production_train_end')}")
+    click.echo(f"Candidate Count     : {res.get('candidates_count', 0)}")
     click.echo(f"-------------------------------------------------------")
     for cand in res.get("candidates", [])[:10]:
         click.echo(f"  #{cand['rank']:<2} {cand['ts_code']:<10} {cand['name']:<10} Score: {cand['score']:.4f} Close: {cand['close']:.2f} Cost100: {cand.get('cost_100_shares', 'N/A')}")
-    click.echo(f"Daily Report Path: {res.get('report_path')}")
+    click.echo(f"Daily Report Path   : {res.get('report_path')}")
+    click.echo(f"-------------------------------------------------------")
+    click.echo(f"提示: 'ashare-quant update-data' 目前只更新 custom Parquet/DuckDB，不更新 Qlib Provider。")
+    click.echo(f"如需更新 Qlib Provider，请通过官方 Qlib collector / dump_bin 工作流进行。")
     click.echo(f"=======================================================\n")
 
 

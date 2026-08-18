@@ -50,6 +50,9 @@ class ExperimentTracker:
         label_spec: Optional[Dict[str, Any]] = None,
         walk_forward_config: Optional[Dict[str, Any]] = None,
         universe: Optional[Dict[str, Any]] = None,
+        research_start_date: Optional[str] = None,
+        research_end_date: Optional[str] = None,
+        provider_data_end_date: Optional[str] = None,
         train_end_date: Optional[str] = None,
         data_end_date: Optional[str] = None,
         label_mature_end_date: Optional[str] = None,
@@ -60,10 +63,14 @@ class ExperimentTracker:
         """
         创建一个唯一 experiment_id 并创建归档文件夹，记录完整元数据
 
-        日期语义（5D future label 下不得混为一个时间）:
-        - data_end_date: provider/行情数据的最后交易日
-        - label_mature_end_date: 最后一个训练标签已成熟的交易日 (data_end - horizon)
-        - production_train_end_date: 生产模型实际训练截止 (= label_mature_end_date)
+        日期语义（5D future label 下严格分离）:
+        - research_start_date: Walk-Forward 历史研究/OOS评估起始日期
+        - research_end_date: Walk-Forward 历史研究/OOS评估截止日期
+        - provider_data_end_date: 真实 Provider 包含的最新交易日 (不被 walk_forward 过滤截断)
+        - production_train_end_date: 生产模型实际训练截止 (provider_data_end - horizon)
+        - label_mature_end_date: 最后一个标签成熟的交易日 (= production_train_end_date)
+        - data_end_date: 兼容别名 (= provider_data_end_date)
+        - train_end_date: 兼容别名 (= production_train_end_date)
         """
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         exp_id = f"{timestamp_str}_{name}"
@@ -85,10 +92,13 @@ class ExperimentTracker:
             "label_spec": label_spec or {},
             "walk_forward_config": walk_forward_config or {},
             "universe": universe or {},
-            "train_end_date": train_end_date or "",
-            "data_end_date": data_end_date or "",
-            "label_mature_end_date": label_mature_end_date or "",
-            "production_train_end_date": production_train_end_date or "",
+            "research_start_date": research_start_date or "",
+            "research_end_date": research_end_date or "",
+            "provider_data_end_date": provider_data_end_date or data_end_date or "",
+            "production_train_end_date": production_train_end_date or train_end_date or "",
+            "train_end_date": train_end_date or production_train_end_date or "",
+            "data_end_date": data_end_date or provider_data_end_date or "",
+            "label_mature_end_date": label_mature_end_date or production_train_end_date or "",
             "data_snapshot_id": data_snapshot_id or f"snapshot_{timestamp_str}",
             "provider_uri": provider_uri or "",
             "git_commit_sha": get_git_commit_sha(),

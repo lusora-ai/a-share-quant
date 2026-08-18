@@ -22,10 +22,14 @@ from ashare_quant.utils.logging import setup_logger
 
 logger = setup_logger("ashare_quant.signals.daily")
 
+class StaleMarketDataError(RuntimeError):
+    """Raised when requesting a signal date beyond the available provider data."""
+    pass
+
 class DailySignalPipeline:
     """
     真实生产选股信号管线
-    严格校验实验元数据与模型文件，无数据/无模型时直接抛出异常终止
+    严格校验实验元数据与模型文件，无数据/无模型/数据过旧时直接抛出异常终止
     """
     def __init__(self, exp_dir: str = "experiments"):
         self.exp_dir = Path(exp_dir)
@@ -68,46 +72,37 @@ class DailySignalPipeline:
 
     def _fetch_alpha158_real_close_and_name(
         self,
-        provider_uri: str,
-        calc_date: str
+        calc_date: str,
+        instruments: List[str]
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        从真实 Qlib provider 读取 calc_date 日期的 $close 价格和证券名称。
-        返回 (close_df, name_df)，close_df 列: [instrument, close]
+        使用 Qlib Data API (from qlib.data import D) 读取 $close 和 $factor。
+        计算真实未复权成交参考价: raw_close = $close / $factor (禁止直接把复权 close.day.bin 当真实股价)。
         """
-        p = Path(provider_uri)
-        cal_file = p / "calendars" / "day.txt"
-        calendar_dates = [line.strip() for line in cal_file.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if calc_date not in calendar_dates:
-            raise ValueError(f"Date '{calc_date}' not found in Qlib calendar.")
-        cal_idx = calendar_dates.index(calc_date)
+        from qlib.data import D
 
-        # 读取 CSI300 股票清单
-        csi300_file = p / "instruments" / "csi300.txt"
-        instruments = []
-        if csi300_file.exists():
-            for line in csi300_file.read_text(encoding="utf-8").splitlines():
-                parts = line.strip().split()
-                if parts:
-                    instruments.append(parts[0])
-        if not instruments:
-            instruments = [d.name.upper() for d in (p / "features").iterdir() if d.is_dir() and not d.name.startswith("sh000300")]
+        q_instruments = [to_qlib_symbol(inst) for inst in instruments]
+        try:
+            price_df = D.features(
+                q_instruments,
+                fields=["$close", "$factor"],
+                start_time=calc_date,
+                end_time=calc_date,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch $close and $factor from Qlib for date '{calc_date}': {e}") from e
 
-        records = []
-        for inst in instruments:
-            f_bin = p / "features" / inst.lower() / "close.day.bin"
-            if f_bin.exists():
-                data = np.fromfile(f_bin, dtype="<f")
-                if len(data) > 1:
-                    start_idx = int(data[0])
-                    values = data[1:]
-                    offset = cal_idx - start_idx
-                    if 0 <= offset < len(values):
-                        val = float(values[offset])
-                        if not np.isnan(val) and val > 0:
-                            records.append({"instrument": inst.upper(), "close": round(val, 2)})
+        if price_df is None or price_df.empty:
+            raise RuntimeError(f"Qlib returned empty features for date '{calc_date}'.")
 
-        close_df = pd.DataFrame(records) if records else pd.DataFrame(columns=["instrument", "close"])
+        price_df = price_df.reset_index()
+        if "$close" not in price_df.columns or "$factor" not in price_df.columns:
+            raise RuntimeError(f"Qlib features missing $close or $factor. Columns: {list(price_df.columns)}")
+
+        price_df["instrument"] = price_df["instrument"].astype(str)
+        factor = price_df["$factor"].replace(0, np.nan).fillna(1.0)
+        price_df["raw_close"] = (price_df["$close"] / factor).round(2)
+        close_df = price_df[["instrument", "raw_close"]].rename(columns={"raw_close": "close"}).dropna()
 
         # 证券名称：尝试从项目 stock_master 匹配
         name_df = pd.DataFrame(columns=["instrument", "name"])
@@ -153,16 +148,22 @@ class DailySignalPipeline:
 
             cal_file = Path(resolved_uri) / "calendars" / "day.txt"
             calendar_dates = [line.strip() for line in cal_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+            provider_data_end_date = calendar_dates[-1]
 
-            # P1-3: target_date 禁止 silent fallback
+            # Provider Freshness Guard: 校验信号日期与 Provider 数据新鲜度
             if target_date is not None:
+                if target_date > provider_data_end_date:
+                    raise StaleMarketDataError(
+                        f"Requested signal date '{target_date}' exceeds Qlib provider latest date '{provider_data_end_date}'. "
+                        f"Qlib provider market data is stale. Please update Qlib data before running daily signal."
+                    )
                 if target_date not in calendar_dates:
-                    raise ValueError(f"ERROR: requested date unavailable: '{target_date}'.")
+                    raise ValueError(f"ERROR: requested date unavailable in Qlib calendar: '{target_date}'.")
                 calc_date = target_date
             else:
-                calc_date = calendar_dates[-1]
+                calc_date = provider_data_end_date
 
-            logger.info(f"Computing official Qlib Alpha158 features for date '{calc_date}'...")
+            logger.info(f"Computing official Qlib Alpha158 features for date '{calc_date}' (Provider End: {provider_data_end_date})...")
             alpha_adapter = OfficialQlibAlpha158()
             handler = alpha_adapter.create_handler_instance(
                 instruments="csi300",
@@ -184,8 +185,8 @@ class DailySignalPipeline:
 
             pred_df["ts_code"] = pred_df["instrument"].astype(str).apply(from_qlib_symbol)
 
-            # 获取真实 close 和 name（不许 fake close=0.0）
-            close_df, name_df = self._fetch_alpha158_real_close_and_name(resolved_uri, calc_date)
+            # 获取真实未复权 raw close 与证券名称 (通过 Qlib Data API: $close / $factor)
+            close_df, name_df = self._fetch_alpha158_real_close_and_name(calc_date, pred_df["ts_code"].tolist())
             pred_df = pred_df.merge(close_df, on="instrument", how="left")
             pred_df["close"] = pred_df["close"].fillna(0.0)
 
@@ -210,14 +211,20 @@ class DailySignalPipeline:
                 processor.close()
 
             available_dates = sorted(df_daily["trade_date"].unique())
+            custom_data_end_date = available_dates[-1]
 
             # P1-3: target_date 禁止 silent fallback
             if target_date is not None:
+                if target_date > custom_data_end_date:
+                    raise StaleMarketDataError(
+                        f"Requested signal date '{target_date}' exceeds daily market data end '{custom_data_end_date}'. "
+                        f"Please run 'ashare-quant update-data' first."
+                    )
                 if target_date not in available_dates:
                     raise ValueError(f"ERROR: requested date unavailable: '{target_date}'.")
                 calc_date = target_date
             else:
-                calc_date = available_dates[-1]
+                calc_date = custom_data_end_date
 
             # 共享 universe 过滤 (与 train 严格复用同一函数)
             df_universe = build_custom12_universe(df_daily, master_df=df_master)
@@ -270,6 +277,9 @@ class DailySignalPipeline:
 
         res = {
             "trade_date": calc_date,
+            "signal_date": calc_date,
+            "provider_data_end": provider_data_end_date if feature_set == "alpha158" else custom_data_end_date,
+            "production_train_end": meta.get("production_train_end_date") or meta.get("train_end_date", ""),
             "model_id": exp_id,
             "data_snapshot_id": f"snapshot_{calc_date}",
             "candidates_count": len(candidates),

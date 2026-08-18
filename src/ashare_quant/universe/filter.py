@@ -9,7 +9,12 @@ logger = setup_logger("ashare_quant.universe.filter")
 class UniverseFilter:
     """
     可交易股票池（Universe）过滤器
-    依据当时可获取的信息构建截面股票池，规避未来函数与幸存者偏差
+    依据当时可获取的信息构建截面股票池，规避未来函数与幸存者偏差。
+
+    【注意 · Point-in-Time 限制提示】:
+    当前传入的 stock_master 是最新截面快照，仅包含最新股票名称与状态。
+    历史历史回测中若使用最新股票名称过滤历史 ST，可能会引入回溯偏差 (Lookahead Bias)。
+    严格的历史 Point-in-Time (PIT) 研究需要引入时序 ST 状态变更历史表。
     """
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or load_config("data").get("universe", {})

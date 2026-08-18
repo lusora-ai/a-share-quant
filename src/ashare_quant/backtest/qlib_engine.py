@@ -43,6 +43,10 @@ class OOSArtifactMissingError(FileNotFoundError):
     """
     pass
 
+class OOSLeakageError(ValueError):
+    """Raised when OOS predictions violate temporal boundaries (e.g. trade_date <= train_end_date)."""
+    pass
+
 def build_qlib_signal(df: pd.DataFrame, score_col: str) -> pd.Series:
     """
     将包含 ts_code, trade_date, score_col 的 DataFrame 转换为 Qlib 规范的 MultiIndex Series。
@@ -99,6 +103,53 @@ class QlibEngineAdapter:
                 "DataSchemaError: Execution dataset missing 'open_raw' or 'close_raw' columns! "
                 "Raw prices are strictly required for cash accounting and 100-share trading units."
             )
+
+    def validate_oos_predictions(self, df: pd.DataFrame, fold_metrics_df: Optional[pd.DataFrame] = None) -> None:
+        """
+        严格验证 OOS 预测集的内容正确性：
+        1. 必须包含字段: trade_date, ts_code, score, fold_id, train_end_date
+        2. 逐行验证: trade_date > train_end_date，任何违规直接抛出 OOSLeakageError
+        3. 若提供 fold_metrics_df，验证每折实际预测日期范围与 fold_metrics 一致
+        """
+        required = ["trade_date", "ts_code", "score", "fold_id", "train_end_date"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise OOSLeakageError(f"OOS predictions missing required columns: {missing}")
+
+        if df.empty:
+            raise OOSLeakageError("OOS predictions DataFrame is empty.")
+
+        # 逐行校验 trade_date > train_end_date
+        leak_mask = df["trade_date"] <= df["train_end_date"]
+        if leak_mask.any():
+            leaked = df[leak_mask]
+            first_row = leaked.iloc[0].to_dict()
+            raise OOSLeakageError(
+                f"OOS Leakage detected: {len(leaked)} prediction rows have trade_date <= train_end_date! "
+                f"First violation: ts_code={first_row.get('ts_code')}, trade_date={first_row.get('trade_date')}, "
+                f"train_end_date={first_row.get('train_end_date')}, fold_id={first_row.get('fold_id')}"
+            )
+
+        # 校验各折预测范围与 fold_metrics 一致性
+        if fold_metrics_df is not None and not fold_metrics_df.empty:
+            for _, fold_row in fold_metrics_df.iterrows():
+                f_id = fold_row.get("fold_id")
+                f_preds = df[df["fold_id"] == f_id]
+                if f_preds.empty:
+                    raise OOSLeakageError(f"OOS predictions missing records for Fold {f_id}.")
+                f_dates = sorted(f_preds["trade_date"].unique())
+                test_start = str(fold_row.get("test_start_date", ""))
+                test_end = str(fold_row.get("test_end_date", ""))
+                if test_start and f_dates[0] != test_start:
+                    raise OOSLeakageError(
+                        f"Fold {f_id} test start date mismatch: predictions start at {f_dates[0]}, "
+                        f"but fold_metrics records {test_start}."
+                    )
+                if test_end and f_dates[-1] != test_end:
+                    raise OOSLeakageError(
+                        f"Fold {f_id} test end date mismatch: predictions end at {f_dates[-1]}, "
+                        f"but fold_metrics records {test_end}."
+                    )
 
     def create_strategy(self, signal: pd.Series, **kwargs) -> TopkDropoutStrategy:
         """

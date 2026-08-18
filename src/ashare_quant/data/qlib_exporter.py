@@ -20,6 +20,14 @@ class QlibDataNotReadyError(FileNotFoundError):
     """Raised when Qlib provider directory is missing or incomplete."""
     pass
 
+class ProviderMismatchError(RuntimeError):
+    """Raised when attempting to reinitialize Qlib with a different provider URI."""
+    pass
+
+class DataSchemaError(ValueError):
+    """Raised when required adjusted price columns are missing for export."""
+    pass
+
 class QlibDataProviderManager:
     """
     Microsoft Qlib 数据环境与初始化管理器
@@ -112,6 +120,14 @@ class QlibDataProviderManager:
 
         if cls._initialized and not force:
             if cls._initialized_provider_uri is not None:
+                if provider_uri is not None:
+                    target_resolved = str(Path(provider_uri).expanduser().resolve())
+                    current_resolved = str(Path(cls._initialized_provider_uri).expanduser().resolve())
+                    if target_resolved != current_resolved:
+                        raise ProviderMismatchError(
+                            f"Qlib is already initialized with provider '{cls._initialized_provider_uri}'. "
+                            f"Cannot reinitialize with different provider '{provider_uri}' in the same process without force=True."
+                        )
                 return cls._initialized_provider_uri
 
         if provider_uri is None:
@@ -148,8 +164,17 @@ class QlibDataProviderManager:
         """
         P0-7: 将 A 股日线数据导出为符合 Qlib 官方 dump_bin.py / DumpDataAll 标准格式的 CSV 文件：
         symbol, date, open, high, low, close, volume, factor, change
-        降级为 CSV 数据准备适配器，禁止自行二进制序列化
+        严格使用 adjusted prices (open_adj, high_adj, low_adj, close_adj, adj_factor)；
+        若缺少复权价格，直接抛出 DataSchemaError 异常，严禁降级使用 raw price。
         """
+        required_cols = ["open_adj", "high_adj", "low_adj", "close_adj", "adj_factor", "volume", "trade_date", "ts_code"]
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise DataSchemaError(
+                f"DataSchemaError: Qlib CSV export requires adjusted price columns: {missing}. "
+                f"Raw price fallback is strictly forbidden by Qlib official specification."
+            )
+
         out_path = Path(target_dir).resolve()
         out_path.mkdir(parents=True, exist_ok=True)
 
@@ -160,12 +185,12 @@ class QlibDataProviderManager:
             sub_csv = pd.DataFrame({
                 "symbol": q_sym,
                 "date": pd.to_datetime(sub["trade_date"]).dt.strftime("%Y-%m-%d"),
-                "open": sub["open_raw"] if "open_raw" in sub.columns else sub["open"],
-                "high": sub["high_raw"] if "high_raw" in sub.columns else sub["high"],
-                "low": sub["low_raw"] if "low_raw" in sub.columns else sub["low"],
-                "close": sub["close_raw"] if "close_raw" in sub.columns else sub["close"],
+                "open": sub["open_adj"],
+                "high": sub["high_adj"],
+                "low": sub["low_adj"],
+                "close": sub["close_adj"],
                 "volume": sub["volume"],
-                "factor": sub["adj_factor"] if "adj_factor" in sub.columns else 1.0,
+                "factor": sub["adj_factor"],
                 "change": sub["pct_chg"] if "pct_chg" in sub.columns else 0.0,
             })
 

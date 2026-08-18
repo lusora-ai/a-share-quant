@@ -408,7 +408,7 @@ def test_qlib_provider_csi300_check_requires_csi300(tmp_path):
 
 def test_alpha158_daily_signal_fetch_real_close():
     """
-    验证 Alpha158 每日信号能从真实 provider 获取 $close 且非假 0
+    验证 Alpha158 每日信号使用 Qlib Data API (D.features) 获取真实未复权 raw_close = $close / $factor
     """
     from ashare_quant.signals.daily import DailySignalPipeline
     from ashare_quant.data.qlib_exporter import QlibDataProviderManager
@@ -418,10 +418,84 @@ def test_alpha158_daily_signal_fetch_real_close():
     calc_date = dates[-1]
 
     pipeline = DailySignalPipeline()
-    close_df, name_df = pipeline._fetch_alpha158_real_close_and_name(uri, calc_date)
+    close_df, name_df = pipeline._fetch_alpha158_real_close_and_name(calc_date, ["SH600000", "SZ000001"])
     assert not close_df.empty
     assert "instrument" in close_df.columns and "close" in close_df.columns
     assert (close_df["close"] > 0).all()
+
+
+def test_qlib_provider_mismatch_error():
+    """
+    验证已初始化 Provider A 时尝试不使用 force 切换到 Provider B 会抛出 ProviderMismatchError
+    """
+    from ashare_quant.data.qlib_exporter import QlibDataProviderManager, ProviderMismatchError
+    QlibDataProviderManager.init_qlib()
+    with pytest.raises(ProviderMismatchError, match="already initialized"):
+        QlibDataProviderManager.init_qlib(provider_uri="C:/another/fake/qlib_provider_path", force=False)
+
+
+def test_qlib_csv_exporter_requires_adjusted_prices():
+    """
+    验证 Qlib CSV exporter 必须提供 adjusted prices，缺少时抛出 DataSchemaError，严禁 fallback raw prices
+    """
+    from ashare_quant.data.qlib_exporter import QlibDataProviderManager, DataSchemaError
+    invalid_df = pd.DataFrame({
+        "ts_code": ["600000.SH"],
+        "trade_date": ["2020-01-02"],
+        "open_raw": [10.0],
+        "close_raw": [10.5],
+        "volume": [1000]
+    })
+    with pytest.raises(DataSchemaError, match="DataSchemaError"):
+        QlibDataProviderManager.export_to_csv_dump_format(invalid_df)
+
+
+def test_daily_signal_stale_market_data_guard():
+    """
+    验证 daily-signal 请求超出 Provider 日期的信号时抛出 StaleMarketDataError
+    """
+    from ashare_quant.signals.daily import DailySignalPipeline, StaleMarketDataError
+    pipeline = DailySignalPipeline()
+    with pytest.raises(StaleMarketDataError, match="stale"):
+        pipeline.run_daily_pipeline(target_date="2099-12-31")
+
+
+def test_backtest_oos_leakage_detection():
+    """
+    验证 QlibEngineAdapter.validate_oos_predictions 逐行检测 trade_date <= train_end_date 泄漏
+    """
+    from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, OOSLeakageError
+    adapter = QlibEngineAdapter()
+
+    # 1. 缺失必需列
+    invalid_cols_df = pd.DataFrame({
+        "trade_date": ["2020-01-02"],
+        "ts_code": ["600000.SH"],
+        "score": [0.5]
+    })
+    with pytest.raises(OOSLeakageError, match="missing required columns"):
+        adapter.validate_oos_predictions(invalid_cols_df)
+
+    # 2. 存在未来信息回溯/穿越 (trade_date <= train_end_date)
+    leaked_df = pd.DataFrame({
+        "trade_date": ["2019-01-02", "2018-05-01"],
+        "ts_code": ["600000.SH", "600000.SH"],
+        "score": [0.5, 0.6],
+        "fold_id": [1, 1],
+        "train_end_date": ["2018-12-31", "2018-12-31"]  # 2018-05-01 <= 2018-12-31 (LEAK!)
+    })
+    with pytest.raises(OOSLeakageError, match="OOS Leakage detected"):
+        adapter.validate_oos_predictions(leaked_df)
+
+    # 3. 合法 OOS 数据通过验证
+    valid_df = pd.DataFrame({
+        "trade_date": ["2019-01-02", "2019-01-03"],
+        "ts_code": ["600000.SH", "600000.SH"],
+        "score": [0.5, 0.6],
+        "fold_id": [1, 1],
+        "train_end_date": ["2018-12-31", "2018-12-31"]
+    })
+    adapter.validate_oos_predictions(valid_df)
 
 
 # ======================= Integration Tests =======================
