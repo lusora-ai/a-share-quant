@@ -44,9 +44,11 @@ ashare-quant = "ashare_quant.cli:cli"
 where = ["src"]
 
 [tool.pytest.ini_options]
+pythonpath = [".", "src"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
 markers = [
     "integration: integration tests with real Qlib execution",
 ]
+

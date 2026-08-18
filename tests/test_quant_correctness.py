@@ -17,6 +17,7 @@ from ashare_quant.data.qlib_exporter import QlibDataProviderManager
 from ashare_quant.features.custom12 import Custom12Factors, FACTOR_NAMES_12
 from ashare_quant.features.qlib_alpha158 import OfficialQlibAlpha158
 from ashare_quant.labels.executable_5d import ExecutableLabel5D
+from ashare_quant.models.qlib_lgbm import OfficialQlibLGBMModel
 from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, DataSchemaError, build_qlib_signal
 from ashare_quant.validation.purged_walk_forward import PurgedWalkForwardEvaluator
 from ashare_quant.signals.daily import DailySignalPipeline
@@ -126,39 +127,93 @@ def test_slippage_cost_configuration():
 @pytest.mark.integration
 def test_real_qlib_end_to_end_smoke():
     """
-    P1-8 端到端集成烟测:
-    真实导出 Qlib 二进制数据 -> 初始化 Qlib -> 运行 Qlib LGBModel 训练 -> 预测 -> Qlib 回测
+    P1-6 真实端到端 Qlib 集成测试:
+    REAL QLIB PROVIDER -> Alpha158 Handler -> DatasetH -> LGBModel.fit -> model.predict(test) 
+    -> assert OOS prediction not empty -> TopkDropoutStrategy -> Qlib Backtest -> assert portfolio report not empty.
+    严禁使用 random score!
     """
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        mock_df = generate_mock_daily_data(num_stocks=4, num_days=50)
-        
-        # 1. 导出真实 Qlib 二进制行情数据
-        provider_path = QlibDataProviderManager.dump_df_to_qlib_bin(mock_df, target_dir=tmp_dir)
-        assert os.path.exists(os.path.join(provider_path, "calendars", "day.txt"))
-        assert os.path.exists(os.path.join(provider_path, "instruments", "all.txt"))
-        
-        # 2. 初始化 Qlib
-        QlibDataProviderManager.init_qlib(provider_uri=provider_path, force=True)
-        
-        # 3. 构建信号 Series
-        mock_df["score"] = np.random.uniform(0, 1, len(mock_df))
-        signal_series = build_qlib_signal(mock_df, score_col="score")
-        assert not signal_series.empty
-        assert isinstance(signal_series.index, pd.MultiIndex)
-        
-        # 4. 执行 Qlib 回测
-        dates = sorted(mock_df["trade_date"].unique())
-        engine = QlibEngineAdapter()
-        report_df, metrics = engine.run_qlib_backtest(
-            signal_series=signal_series,
-            start_time=dates[0],
-            end_time=dates[-1],
-            benchmark="SH000300"
-        )
-        
-        assert report_df is not None
-        assert not report_df.empty
-        assert "return" in report_df.columns
-        assert isinstance(metrics, dict)
-        assert "annual_return" in metrics
-        assert "sharpe" in metrics
+    provider_uri = QlibDataProviderManager.init_qlib()
+    assert os.path.exists(os.path.join(provider_uri, "calendars", "day.txt"))
+    assert os.path.exists(os.path.join(provider_uri, "instruments", "all.txt"))
+
+    # 1. 实例化真实 Alpha158 Handler
+    alpha_adapter = OfficialQlibAlpha158()
+    handler = alpha_adapter.create_handler_instance(
+        instruments="csi300",
+        start_time="2019-01-01",
+        end_time="2019-06-30",
+        fit_start_time="2019-01-01",
+        fit_end_time="2019-03-31"
+    )
+
+    # 2. 构建 DatasetH
+    dataset = DatasetH(
+        handler=handler,
+        segments={
+            "train": ("2019-01-01", "2019-03-31"),
+            "valid": ("2019-04-01", "2019-04-30"),
+            "test": ("2019-05-01", "2019-06-30"),
+        }
+    )
+
+    # 3. 真实训练 Qlib LGBModel
+    model = OfficialQlibLGBMModel(
+        config={"model": {"learning_rate": 0.05, "n_estimators": 10, "num_leaves": 15, "max_depth": 3, "random_state": 42}}
+    )
+    model.fit(dataset)
+
+    # 4. 真实预测 Test Segment (OOS Predictions)
+    test_preds = model.predict(dataset, segment="test")
+    assert test_preds is not None
+    assert not test_preds.empty
+    assert isinstance(test_preds.index, pd.MultiIndex)
+    assert len(test_preds) > 0
+
+    # 5. 执行 Qlib 回测 (TopkDropoutStrategy + SimulatorExecutor)
+    engine = QlibEngineAdapter()
+    report_df, metrics = engine.run_qlib_backtest(
+        signal_series=test_preds,
+        start_time="2019-05-01",
+        end_time="2019-06-30",
+        benchmark="SH000300"
+    )
+
+    assert report_df is not None
+    assert not report_df.empty
+    assert "return" in report_df.columns
+    assert isinstance(metrics, dict)
+    assert "portfolio_annualized_return" in metrics
+    assert "portfolio_sharpe" in metrics
+    assert "portfolio_max_drawdown" in metrics
+    assert "information_ratio" in metrics
+
+def test_qlib_backtest_with_synthetic_signal():
+    """
+    单独测试 Qlib 回测适配器与合成信号的交互逻辑 (与端到端模型训练集成测试分离)
+    """
+    provider_uri = QlibDataProviderManager.init_qlib()
+    cal_file = Path(provider_uri) / "calendars" / "day.txt"
+    dates = [line.strip() for line in cal_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    test_dates = [d for d in dates if "2019-05-01" <= d <= "2019-05-31"]
+
+    tuples = []
+    values = []
+    for d in test_dates:
+        for s in ["SH600000", "SZ000001", "SZ000002"]:
+            tuples.append((pd.to_datetime(d), s))
+            values.append(0.5)
+
+    index = pd.MultiIndex.from_tuples(tuples, names=["datetime", "instrument"])
+    signal_series = pd.Series(values, index=index, dtype=float)
+
+    engine = QlibEngineAdapter()
+    report_df, metrics = engine.run_qlib_backtest(
+        signal_series=signal_series,
+        start_time="2019-05-01",
+        end_time="2019-05-31",
+        benchmark="SH000300"
+    )
+    assert report_df is not None
+    assert not report_df.empty
+    assert "portfolio_annualized_return" in metrics
+

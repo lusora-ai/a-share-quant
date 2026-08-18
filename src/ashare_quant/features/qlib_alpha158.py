@@ -36,16 +36,30 @@ class OfficialQlibAlpha158:
         _, names = cls.get_feature_config()
         return names
 
-    def create_handler_instance(self, instruments: str = "csi300", start_time: str = "2018-01-01", end_time: Optional[str] = None):
+    def create_handler_instance(
+        self,
+        instruments: str = "csi300",
+        start_time: str = "2018-01-01",
+        end_time: Optional[str] = None,
+        fit_start_time: Optional[str] = None,
+        fit_end_time: Optional[str] = None,
+        **kwargs
+    ):
         """
         实例化 Qlib 官方 Alpha158 Data Handler
         """
         logger.info(f"Instantiating official qlib.contrib.data.handler.Alpha158 for {instruments}...")
+        handler_kwargs = {**self.extra_kwargs, **kwargs}
+        if fit_start_time is not None:
+            handler_kwargs["fit_start_time"] = fit_start_time
+        if fit_end_time is not None:
+            handler_kwargs["fit_end_time"] = fit_end_time
+            
         handler = self.handler_cls(
             instruments=instruments,
             start_time=start_time,
             end_time=end_time,
-            **self.extra_kwargs
+            **handler_kwargs
         )
         return handler
 

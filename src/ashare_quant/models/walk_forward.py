@@ -25,7 +25,7 @@ class WalkForwardEvaluator:
             c for c in df_all.columns
             if c not in ["ts_code", "trade_date", "open", "high", "low", "close", "volume", "amount", "turn", "pct_chg", "is_suspended", "open_raw", "close_raw", "open_adj", "close_adj", "high_adj", "low_adj", label_col, "year"]
         ]
-        fold_df, summary = self.evaluator.run_purged_walk_forward(
+        fold_df, summary, _ = self.evaluator.run_purged_walk_forward(
             df_all=df_all,
             feature_cols=feature_cols,
             label_col=label_col,

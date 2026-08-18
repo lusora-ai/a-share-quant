@@ -17,6 +17,6 @@ def test_walk_forward_evaluator():
     fold_df, summary = wf_evaluator.run_walk_forward(df_all)
     
     assert not fold_df.empty
-    assert "fold" in fold_df.columns
+    assert "fold_id" in fold_df.columns
     assert "mean_ic" in fold_df.columns
     assert "avg_fold_ic" in summary

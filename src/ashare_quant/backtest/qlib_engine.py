@@ -158,16 +158,34 @@ class QlibEngineAdapter:
         strategy = self.create_strategy(signal=signal_series)
         executor = self.create_executor(time_per_step="day", generate_portfolio_metrics=True)
         
+        bench_sym = to_qlib_symbol(benchmark) if benchmark else None
+        
         try:
-            portfolio_metric_dict, indicator_dict = qlib_backtest(
-                start_time=start_time,
-                end_time=end_time,
-                strategy=strategy,
-                executor=executor,
-                benchmark=to_qlib_symbol(benchmark),
-                account=self.initial_capital,
-                exchange_kwargs=exchange_kwargs
-            )
+            try:
+                portfolio_metric_dict, indicator_dict = qlib_backtest(
+                    start_time=start_time,
+                    end_time=end_time,
+                    strategy=strategy,
+                    executor=executor,
+                    benchmark=bench_sym,
+                    account=self.initial_capital,
+                    exchange_kwargs=exchange_kwargs
+                )
+            except Exception as bench_err:
+                if bench_sym and ("does not exist" in str(bench_err).lower() or "benchmark" in str(bench_err).lower()):
+                    logger.warning(f"Benchmark '{bench_sym}' unavailable for {start_time} to {end_time} in current Qlib provider. Running backtest without benchmark comparison.")
+                    portfolio_metric_dict, indicator_dict = qlib_backtest(
+                        start_time=start_time,
+                        end_time=end_time,
+                        strategy=strategy,
+                        executor=executor,
+                        benchmark=None,
+                        account=self.initial_capital,
+                        exchange_kwargs=exchange_kwargs
+                    )
+                else:
+                    raise bench_err
+
             
             # P0-2: 正确解包 portfolio_metric_dict["1day"] -> Tuple[pd.DataFrame, dict]
             metric_res = portfolio_metric_dict.get("1day")
@@ -179,23 +197,39 @@ class QlibEngineAdapter:
             if report_df is None or report_df.empty:
                 raise QlibBacktestError("Qlib backtest returned empty portfolio metrics DataFrame.")
 
-            # P0-3: 正确调用与解析 risk_analysis
+            # P1-4: 准确分别计算策略自身、基准与超额收益风险指标
+            port_analysis = risk_analysis(report_df["return"])
+            port_annual_ret = float(port_analysis.loc["annualized_return", "risk"]) if "annualized_return" in port_analysis.index else 0.0
+            port_sharpe = float(port_analysis.loc["information_ratio", "risk"]) if "information_ratio" in port_analysis.index else 0.0
+            port_max_dd = float(port_analysis.loc["max_drawdown", "risk"]) if "max_drawdown" in port_analysis.index else 0.0
+
             bench_col = "bench" if "bench" in report_df.columns else None
-            ret_series = report_df["return"] - report_df[bench_col] if bench_col else report_df["return"]
-            analysis_res = risk_analysis(ret_series)
-            
-            # 从 DataFrame 中按行列索引解析风险与收益统计
-            annual_ret = float(analysis_res.loc["annualized_return", "risk"]) if "annualized_return" in analysis_res.index else 0.0
-            sharpe = float(analysis_res.loc["information_ratio", "risk"]) if "information_ratio" in analysis_res.index else 0.0
-            max_dd = float(analysis_res.loc["max_drawdown", "risk"]) if "max_drawdown" in analysis_res.index else 0.0
-            bench_ret = float(report_df[bench_col].mean() * 252) if bench_col else 0.0
-            
+            if bench_col and not report_df[bench_col].isna().all():
+                bench_analysis = risk_analysis(report_df[bench_col])
+                bench_annual_ret = float(bench_analysis.loc["annualized_return", "risk"]) if "annualized_return" in bench_analysis.index else 0.0
+                
+                excess_series = report_df["return"] - report_df[bench_col]
+                excess_analysis = risk_analysis(excess_series)
+                excess_annual_ret = float(excess_analysis.loc["annualized_return", "risk"]) if "annualized_return" in excess_analysis.index else 0.0
+                info_ratio = float(excess_analysis.loc["information_ratio", "risk"]) if "information_ratio" in excess_analysis.index else 0.0
+            else:
+                bench_annual_ret = 0.0
+                excess_annual_ret = port_annual_ret
+                info_ratio = port_sharpe
+
             metrics = {
-                "annual_return": annual_ret,
-                "benchmark_return": bench_ret,
-                "excess_return": annual_ret,
-                "sharpe": sharpe,
-                "max_drawdown": max_dd,
+                "portfolio_annualized_return": port_annual_ret,
+                "benchmark_annualized_return": bench_annual_ret,
+                "excess_annualized_return": excess_annual_ret,
+                "portfolio_max_drawdown": port_max_dd,
+                "portfolio_sharpe": port_sharpe,
+                "information_ratio": info_ratio,
+                # 兼容性别名
+                "annual_return": port_annual_ret,
+                "benchmark_return": bench_annual_ret,
+                "excess_return": excess_annual_ret,
+                "sharpe": port_sharpe,
+                "max_drawdown": port_max_dd,
             }
             return report_df, metrics
         except Exception as e:
