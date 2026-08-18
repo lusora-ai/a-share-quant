@@ -118,18 +118,23 @@ def test_backtest_failure_raises():
         )
     )
 
+    mock_preflight = pd.DataFrame(
+        {"$close": [10.0, 10.0], "$factor": [1.0, 1.0]},
+        index=dummy_signal.index
+    )
     with patch.object(adapter, "create_strategy", return_value="mock_strategy"):
         with patch.object(adapter, "create_executor", return_value="mock_executor"):
             with patch("ashare_quant.data.qlib_exporter.QlibDataProviderManager.init_qlib"):
-                with patch("ashare_quant.backtest.qlib_engine.qlib_backtest", side_effect=ValueError("Simulated low-level exchange failure")):
-                    with pytest.raises(QlibBacktestError) as excinfo:
-                        adapter.run_qlib_backtest(
-                            signal_series=dummy_signal,
-                            start_time="2024-01-02",
-                            end_time="2024-01-03",
-                            benchmark="SH000300"
-                        )
-                    assert "Simulated low-level exchange failure" in str(excinfo.value)
+                with patch.object(qlib.data.D, "features", create=True, return_value=mock_preflight):
+                    with patch("ashare_quant.backtest.qlib_engine.qlib_backtest", side_effect=ValueError("Simulated low-level exchange failure")):
+                        with pytest.raises(QlibBacktestError) as excinfo:
+                            adapter.run_qlib_backtest(
+                                signal_series=dummy_signal,
+                                start_time="2024-01-02",
+                                end_time="2024-01-03",
+                                benchmark="SH000300"
+                            )
+                        assert "Simulated low-level exchange failure" in str(excinfo.value)
 
 def test_qlib_data_not_ready_raises():
     """

@@ -115,17 +115,32 @@ class QlibEngineAdapter:
     def validate_oos_predictions(self, df: pd.DataFrame, fold_metrics_df: Optional[pd.DataFrame] = None) -> None:
         """
         严格验证 OOS 预测集的内容正确性：
-        1. 必须包含字段: trade_date, ts_code, score, fold_id, train_end_date
-        2. 逐行验证: trade_date > train_end_date，任何违规直接抛出 OOSLeakageError
-        3. 若提供 fold_metrics_df，验证每折实际预测日期范围与 fold_metrics 一致
+        1. 必须提供 fold_metrics_df，缺失则抛出 OOSArtifactMissingError
+        2. 必须包含字段: trade_date, ts_code, score, fold_id, train_end_date
+        3. 逐行验证: trade_date > train_end_date，任何违规直接抛出 OOSLeakageError
+        4. 检查 (trade_date, ts_code) 重复记录，禁止重复预测
+        5. 验证预测集中的 fold_id 均在 fold_metrics 中合法注册，禁止未知 fold_id
+        6. 验证每折实际预测日期范围严格处于 [test_start_date, test_end_date] 之内
         """
+        if fold_metrics_df is None or fold_metrics_df.empty:
+            raise OOSArtifactMissingError(
+                "OOSArtifactMissingError: fold_metrics.parquet is required for strict OOS backtest validation. "
+                "Backtest cannot proceed without fold metrics artifact."
+            )
+
         required = ["trade_date", "ts_code", "score", "fold_id", "train_end_date"]
         missing = [c for c in required if c not in df.columns]
         if missing:
-            raise OOSLeakageError(f"OOS predictions missing required columns: {missing}")
+            raise OOSLeakageError(f"OOSLeakageError: OOS predictions missing required columns: {missing}")
 
         if df.empty:
-            raise OOSLeakageError("OOS predictions DataFrame is empty.")
+            raise OOSLeakageError("OOSLeakageError: OOS predictions DataFrame is empty.")
+
+        # 检查重复 (trade_date, ts_code)
+        duplicates = df.duplicated(subset=["trade_date", "ts_code"], keep=False)
+        if duplicates.any():
+            dup_samples = df[duplicates].head(5).to_dict("records")
+            raise OOSLeakageError(f"OOSLeakageError: Duplicate (trade_date, ts_code) records found in OOS predictions: {dup_samples}")
 
         # 逐行校验 trade_date > train_end_date
         leak_mask = df["trade_date"] <= df["train_end_date"]
@@ -138,26 +153,33 @@ class QlibEngineAdapter:
                 f"train_end_date={first_row.get('train_end_date')}, fold_id={first_row.get('fold_id')}"
             )
 
-        # 校验各折预测范围与 fold_metrics 一致性
-        if fold_metrics_df is not None and not fold_metrics_df.empty:
-            for _, fold_row in fold_metrics_df.iterrows():
-                f_id = fold_row.get("fold_id")
-                f_preds = df[df["fold_id"] == f_id]
-                if f_preds.empty:
-                    raise OOSLeakageError(f"OOS predictions missing records for Fold {f_id}.")
-                f_dates = sorted(f_preds["trade_date"].unique())
-                test_start = str(fold_row.get("test_start_date", ""))
-                test_end = str(fold_row.get("test_end_date", ""))
-                if test_start and f_dates[0] != test_start:
-                    raise OOSLeakageError(
-                        f"Fold {f_id} test start date mismatch: predictions start at {f_dates[0]}, "
-                        f"but fold_metrics records {test_start}."
-                    )
-                if test_end and f_dates[-1] != test_end:
-                    raise OOSLeakageError(
-                        f"Fold {f_id} test end date mismatch: predictions end at {f_dates[-1]}, "
-                        f"but fold_metrics records {test_end}."
-                    )
+        # 校验 fold_id 合法性与范围一致性
+        valid_fold_ids = set(fold_metrics_df["fold_id"].unique())
+        actual_fold_ids = set(df["fold_id"].unique())
+        unknown_folds = actual_fold_ids - valid_fold_ids
+        if unknown_folds:
+            raise OOSLeakageError(
+                f"OOSLeakageError: Unknown fold_id {unknown_folds} found in OOS predictions. Registered folds: {valid_fold_ids}"
+            )
+
+        for _, fold_row in fold_metrics_df.iterrows():
+            f_id = fold_row.get("fold_id")
+            f_preds = df[df["fold_id"] == f_id]
+            if f_preds.empty:
+                raise OOSLeakageError(f"OOSLeakageError: OOS predictions missing records for Fold {f_id}.")
+            f_dates = sorted(f_preds["trade_date"].unique())
+            test_start = str(fold_row.get("test_start_date", ""))
+            test_end = str(fold_row.get("test_end_date", ""))
+            if test_start and f_dates[0] < test_start:
+                raise OOSLeakageError(
+                    f"Fold {f_id} test start date violation: predictions start at {f_dates[0]}, "
+                    f"which is before fold test_start_date {test_start}."
+                )
+            if test_end and f_dates[-1] > test_end:
+                raise OOSLeakageError(
+                    f"Fold {f_id} test end date violation: predictions end at {f_dates[-1]}, "
+                    f"which is after fold test_end_date {test_end}."
+                )
 
     def create_strategy(self, signal: pd.Series, **kwargs) -> TopkDropoutStrategy:
         """
@@ -221,31 +243,51 @@ class QlibEngineAdapter:
         # 确保 Qlib 使用指定的 Provider 初始化
         QlibDataProviderManager.init_qlib(provider_uri=provider_uri)
 
-        # Preflight: 检查 signal universe 中 $close 对应的 $factor 必须存在且 > 0
+        # Preflight (Fail-Closed): 检查 signal universe 中全部标的的 $close 与 $factor 有效性
         from qlib.data import D
         insts = list(signal_series.index.get_level_values("instrument").unique())
         if insts:
-            try:
-                preflight_df = D.features(
-                    insts[:min(10, len(insts))],
-                    fields=["$close", "$factor"],
-                    start_time=start_time,
-                    end_time=end_time
-                )
-                if preflight_df is not None and not preflight_df.empty:
-                    if "$factor" not in preflight_df.columns:
+            batch_size = 100
+            for i in range(0, len(insts), batch_size):
+                batch_insts = insts[i:i + batch_size]
+                try:
+                    preflight_df = D.features(
+                        batch_insts,
+                        fields=["$close", "$factor"],
+                        start_time=start_time,
+                        end_time=end_time
+                    )
+                except Exception as query_err:
+                    raise QlibExecutionDataError(
+                        f"QlibExecutionDataError: D.features query failed during factor preflight for instruments {batch_insts[:5]}: {query_err}"
+                    ) from query_err
+
+                if preflight_df is None or preflight_df.empty:
+                    raise QlibExecutionDataError(
+                        f"QlibExecutionDataError: D.features returned empty features during factor preflight for instruments {batch_insts[:5]}."
+                    )
+
+                if "$close" not in preflight_df.columns or "$factor" not in preflight_df.columns:
+                    raise QlibExecutionDataError(
+                        "QlibExecutionDataError: Qlib provider lacks '$close' or '$factor' required for trade_unit=100 execution."
+                    )
+
+                # 对于 $close 存在有限数值的每一行，$factor 必须存在、有限且 > 0
+                valid_close_mask = pd.notna(preflight_df["$close"]) & np.isfinite(preflight_df["$close"])
+                if valid_close_mask.any():
+                    factors = preflight_df.loc[valid_close_mask, "$factor"]
+                    invalid_factor_mask = (
+                        pd.isna(factors) |
+                        (~np.isfinite(factors)) |
+                        (factors <= 0)
+                    )
+                    if invalid_factor_mask.any():
+                        bad_records = preflight_df.loc[valid_close_mask][invalid_factor_mask]
+                        bad_insts = list(bad_records.index.get_level_values("instrument").unique())[:5]
                         raise QlibExecutionDataError(
-                            "QlibExecutionDataError: Qlib provider lacks '$factor' field required for trade_unit=100 execution."
+                            f"QlibExecutionDataError: Missing, non-finite, or non-positive $factor detected for active instruments: {bad_insts} "
+                            f"where $close is valid. Total invalid records: {len(bad_records)}."
                         )
-                    f_series = preflight_df["$factor"].dropna()
-                    if f_series.empty or (f_series <= 0).any():
-                        raise QlibExecutionDataError(
-                            "QlibExecutionDataError: Qlib backtest requires valid positive $factor for 100-share trading units, but non-positive or missing factor was detected."
-                        )
-            except (QlibExecutionDataError, BenchmarkDataMissingError):
-                raise
-            except Exception as e:
-                logger.debug(f"Preflight factor check encountered: {e}")
 
         # 准备 Qlib 回测配置
         exchange_kwargs = {

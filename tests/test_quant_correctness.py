@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
+from datetime import datetime
 import pandas as pd
 import numpy as np
 
@@ -350,21 +351,26 @@ def test_benchmark_unavailable_raises():
     )
 
     from unittest.mock import patch
+    mock_preflight = pd.DataFrame(
+        {"$close": [10.0, 10.0], "$factor": [1.0, 1.0]},
+        index=dummy_signal.index
+    )
     with patch.object(adapter, "create_strategy", return_value="mock_strategy"):
         with patch.object(adapter, "create_executor", return_value="mock_executor"):
             with patch("ashare_quant.data.qlib_exporter.QlibDataProviderManager.init_qlib"):
-                # Simulate benchmark not found error
-                with patch("ashare_quant.backtest.qlib_engine.qlib_backtest",
-                           side_effect=ValueError("SH000300 does not exist")):
-                    with pytest.raises(BenchmarkDataMissingError) as excinfo:
-                        adapter.run_qlib_backtest(
-                            signal_series=dummy_signal,
-                            start_time="2024-01-02",
-                            end_time="2024-01-03",
-                            benchmark="SH000300"
-                        )
-                    assert "SH000300" in str(excinfo.value)
-                    assert "unavailable" in str(excinfo.value).lower()
+                with patch.object(qlib.data.D, "features", create=True, return_value=mock_preflight):
+                    # Simulate benchmark not found error
+                    with patch("ashare_quant.backtest.qlib_engine.qlib_backtest",
+                               side_effect=ValueError("SH000300 does not exist")):
+                        with pytest.raises(BenchmarkDataMissingError) as excinfo:
+                            adapter.run_qlib_backtest(
+                                signal_series=dummy_signal,
+                                start_time="2024-01-02",
+                                end_time="2024-01-03",
+                                benchmark="SH000300"
+                            )
+                        assert "SH000300" in str(excinfo.value)
+                        assert "unavailable" in str(excinfo.value).lower()
 
 
 # ======================= Qlib Provider State Tests =======================
@@ -453,19 +459,50 @@ def test_qlib_csv_exporter_requires_adjusted_prices():
 
 def test_daily_signal_rejects_stale_provider_without_explicit_date():
     """
-    验证未指定 --date 时，若 Provider 截止日期早于预期最新市场日期，必须抛出 StaleMarketDataError
+    验证未指定 --date 时，若 Provider 截止日期早于预期最新市场日期，必须抛出 StaleMarketDataError (确定性 Mock 测试)
     """
     from ashare_quant.signals.daily import DailySignalPipeline, StaleMarketDataError
-    from ashare_quant.data.qlib_exporter import QlibDataProviderManager
-    pipeline = DailySignalPipeline()
+    from unittest.mock import patch
 
-    # 默认调用（target_date=None），由于当前真实年份是 2026 而 provider 截止 2021，必须触发 StaleMarketDataError
-    with pytest.raises(StaleMarketDataError) as excinfo:
-        pipeline.run_daily_pipeline(target_date=None)
-    
-    assert "STALE" in str(excinfo.value)
-    assert "Expected latest completed market date" in str(excinfo.value)
-    assert "Qlib provider data ends at" in str(excinfo.value)
+    pipeline = DailySignalPipeline()
+    with patch("ashare_quant.signals.daily.get_expected_latest_completed_trade_date", return_value="2026-08-18"):
+        with pytest.raises(StaleMarketDataError) as excinfo:
+            pipeline.run_daily_pipeline(target_date=None)
+        assert "STALE" in str(excinfo.value)
+        assert "2026-08-18" in str(excinfo.value)
+
+
+def test_freshness_check_with_stale_calendar_raises():
+    """
+    验证当 cached trade calendar 过期 (如只到 2020 而 today=2026) 时，抛出 MarketCalendarUnavailableError，绝不猜测
+    """
+    from ashare_quant.data.qlib_exporter import get_expected_latest_completed_trade_date, MarketCalendarUnavailableError
+    from unittest.mock import patch
+
+    # 模拟本地日历只到 2020-12-31，today 为 2026-08-18
+    mock_cal_df = pd.DataFrame({"trade_date": ["2020-01-02", "2020-12-31"], "is_open": [1, 1]})
+    with patch("ashare_quant.data.storage.StorageEngine.load_parquet", return_value=mock_cal_df):
+        with patch("ashare_quant.data.fetcher.DataFetcher.fetch_trade_calendar", side_effect=Exception("No network")):
+            with pytest.raises(MarketCalendarUnavailableError, match="Reliable trading calendar"):
+                get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 18, 16, 0, 0))
+
+
+def test_freshness_holiday_spring_festival_accurate():
+    """
+    验证使用中国法定节假日日历时，春节等假期准确回溯至上一有效交易日，不使用简单 weekday / BDay
+    """
+    from ashare_quant.data.qlib_exporter import get_expected_latest_completed_trade_date
+    from unittest.mock import patch
+
+    # 模拟真实日历: 2026-02-13 (周五) 为交易日，2026-02-14 至 2026-02-22 为春节休市 (is_open=0)
+    mock_cal_df = pd.DataFrame({
+        "trade_date": ["2026-02-13", "2026-02-16", "2026-02-17", "2026-02-23"],
+        "is_open": [1, 0, 0, 1]
+    })
+    with patch("ashare_quant.data.storage.StorageEngine.load_parquet", return_value=mock_cal_df):
+        # 在春节假期中的周二 2026-02-17 16:00 查询，最新已完成交易日必须是 2026-02-13，绝不能是 2026-02-17 或 2026-02-16 (BDay)
+        latest_date = get_expected_latest_completed_trade_date(reference_time=datetime(2026, 2, 17, 16, 0, 0))
+        assert latest_date == "2026-02-13"
 
 
 def test_missing_factor_never_falls_back_to_one():
@@ -490,7 +527,6 @@ def test_missing_factor_never_falls_back_to_one():
 
     with patch("qlib.data.D.features", return_value=mock_feat):
         close_df, name_df = pipeline._fetch_alpha158_real_close_and_name("2021-06-11", ["600000.SH", "000001.SZ", "600519.SH"])
-        # SH600000 (NaN factor) 和 SZ000001 (0.0 factor) 必须被完全剔除，绝不能出现 raw_close = 10.0 / 1.0 = 10.0
         assert "SH600000" not in close_df["instrument"].tolist()
         assert "SZ000001" not in close_df["instrument"].tolist()
         assert "SH600519" in close_df["instrument"].tolist()
@@ -503,7 +539,6 @@ def test_daily_candidates_never_have_zero_close():
     """
     from ashare_quant.signals.daily import DailySignalPipeline
     pipeline = DailySignalPipeline()
-    # 显式重放历史有效交易日
     res = pipeline.run_daily_pipeline(target_date="2021-06-11")
     candidates = res.get("candidates", [])
     assert len(candidates) > 0
@@ -515,73 +550,198 @@ def test_daily_candidates_never_have_zero_close():
         assert round(cand["close"] * 100, 2) == cand["cost_100_shares"]
 
 
-def test_backtest_binds_experiment_provider_uri():
+def test_factor_preflight_checks_all_signal_instruments():
     """
-    验证 Backtest 严格使用 experiment metadata 中的 provider_uri，若缺失则报错
-    """
-    from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, ProviderMismatchError
-    from click.testing import CliRunner
-    from ashare_quant.cli import cli
-
-    runner = CliRunner()
-    # 使用不存在 provider_uri 的 mock metadata 验证报错
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fake_exp = Path("experiments") / "test_missing_provider_exp"
-        fake_exp.mkdir(parents=True, exist_ok=True)
-        (fake_exp / "metadata.json").write_text(json.dumps({"feature_set": "alpha158"}), encoding="utf-8")
-        (fake_exp / "oos_predictions.parquet").write_bytes(b"dummy")
-
-        try:
-            res = runner.invoke(cli, ["backtest", "--experiment", "test_missing_provider_exp"])
-            assert res.exit_code != 0
-        finally:
-            shutil.rmtree(fake_exp, ignore_errors=True)
-
-
-def test_backtest_preflight_requires_valid_factor():
-    """
-    验证 QlibEngineAdapter 在 factor 缺失或非正数时抛出 QlibExecutionDataError
+    P0-1: 验证 Factor Preflight 检查全部 signal 标的，前 10 只正常而第 11 只缺失 factor 时必须报错
     """
     from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, QlibExecutionDataError
     from unittest.mock import patch
 
     adapter = QlibEngineAdapter()
-    dummy_signal = pd.Series(
-        [0.85, 0.12],
-        index=pd.MultiIndex.from_tuples(
-            [(pd.to_datetime("2020-01-02"), "SH600000"), (pd.to_datetime("2020-01-02"), "SZ000001")],
-            names=["datetime", "instrument"]
-        )
-    )
+    # 构造 15 只股票的 signal
+    insts = [f"SH6000{i:02d}" for i in range(15)]
+    dates = [pd.to_datetime("2020-01-02")] * 15
+    signal_series = pd.Series([0.5] * 15, index=pd.MultiIndex.from_tuples(list(zip(dates, insts)), names=["datetime", "instrument"]))
 
-    # 模拟 preflight 发现 $factor 缺失
-    mock_feat = pd.DataFrame({"$close": [10.0, 11.0]})  # missing $factor
-    with patch("qlib.data.D.features", return_value=mock_feat):
-        with pytest.raises(QlibExecutionDataError, match="factor"):
-            adapter.run_qlib_backtest(
-                signal_series=dummy_signal,
-                start_time="2020-01-02",
-                end_time="2020-01-03",
-                benchmark="SH000300"
-            )
+    # 前 10 只正常，第 11 只 (SH600010) 缺少 factor
+    def mock_features_side_effect(batch_insts, fields, start_time, end_time):
+        tuples = [(pd.to_datetime("2020-01-02"), inst) for inst in batch_insts]
+        idx = pd.MultiIndex.from_tuples(tuples, names=["datetime", "instrument"])
+        df = pd.DataFrame({"$close": [10.0] * len(batch_insts), "$factor": [1.0] * len(batch_insts)}, index=idx)
+        if "SH600010" in batch_insts:
+            df.loc[(pd.to_datetime("2020-01-02"), "SH600010"), "$factor"] = np.nan
+        return df
+
+    with patch("qlib.data.D.features", side_effect=mock_features_side_effect):
+        with pytest.raises(QlibExecutionDataError, match="Missing, non-finite, or non-positive \\$factor"):
+            adapter.run_qlib_backtest(signal_series=signal_series, start_time="2020-01-02", end_time="2020-01-03", benchmark="SH000300")
 
 
-def test_qlib_status_and_update_cli():
+def test_factor_preflight_rejects_partial_nan():
     """
-    验证 qlib-status 和 update-qlib-data CLI 命令正常输出状态
+    P0-1: 验证 10 条正常 + 1 条 NaN factor 必须抛出 QlibExecutionDataError
+    """
+    from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, QlibExecutionDataError
+    from unittest.mock import patch
+
+    adapter = QlibEngineAdapter()
+    insts = [f"SH6000{i:02d}" for i in range(11)]
+    dates = [pd.to_datetime("2020-01-02")] * 11
+    signal_series = pd.Series([0.5] * 11, index=pd.MultiIndex.from_tuples(list(zip(dates, insts)), names=["datetime", "instrument"]))
+
+    def mock_features(batch_insts, fields, start_time, end_time):
+        tuples = [(pd.to_datetime("2020-01-02"), inst) for inst in batch_insts]
+        idx = pd.MultiIndex.from_tuples(tuples, names=["datetime", "instrument"])
+        df = pd.DataFrame({"$close": [10.0] * len(batch_insts), "$factor": [1.0] * len(batch_insts)}, index=idx)
+        # 最后一只 NaN
+        df.iloc[-1, df.columns.get_loc("$factor")] = np.nan
+        return df
+
+    with patch("qlib.data.D.features", side_effect=mock_features):
+        with pytest.raises(QlibExecutionDataError, match="\\$factor"):
+            adapter.run_qlib_backtest(signal_series=signal_series, start_time="2020-01-02", end_time="2020-01-03", benchmark="SH000300")
+
+
+def test_factor_preflight_data_api_failure_raises():
+    """
+    P0-1: 验证 D.features 抛异常时必须直接 fail-closed，绝不能 logger.debug 后继续
+    """
+    from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, QlibExecutionDataError
+    from unittest.mock import patch
+
+    adapter = QlibEngineAdapter()
+    signal_series = pd.Series([0.5], index=pd.MultiIndex.from_tuples([(pd.to_datetime("2020-01-02"), "SH600000")], names=["datetime", "instrument"]))
+
+    with patch("qlib.data.D.features", side_effect=RuntimeError("Qlib Data API connection failed")):
+        with pytest.raises(QlibExecutionDataError, match="D.features query failed"):
+            adapter.run_qlib_backtest(signal_series=signal_series, start_time="2020-01-02", end_time="2020-01-03", benchmark="SH000300")
+
+
+def test_factor_preflight_empty_return_raises():
+    """
+    P0-1: 验证 D.features 返回空 DataFrame 时必须抛出 QlibExecutionDataError
+    """
+    from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, QlibExecutionDataError
+    from unittest.mock import patch
+
+    adapter = QlibEngineAdapter()
+    signal_series = pd.Series([0.5], index=pd.MultiIndex.from_tuples([(pd.to_datetime("2020-01-02"), "SH600000")], names=["datetime", "instrument"]))
+
+    with patch("qlib.data.D.features", return_value=pd.DataFrame()):
+        with pytest.raises(QlibExecutionDataError, match="empty features"):
+            adapter.run_qlib_backtest(signal_series=signal_series, start_time="2020-01-02", end_time="2020-01-03", benchmark="SH000300")
+
+
+def test_backtest_requires_both_oos_and_fold_metrics():
+    """
+    P1-2: 验证 Backtest 必须同时拥有合法的 oos_predictions 与 fold_metrics，且校验无重复/无未知 fold
+    """
+    from ashare_quant.backtest.qlib_engine import QlibEngineAdapter, OOSArtifactMissingError, OOSLeakageError
+
+    adapter = QlibEngineAdapter()
+    valid_oos = pd.DataFrame({
+        "trade_date": ["2019-01-02", "2019-01-03"],
+        "ts_code": ["600000.SH", "600000.SH"],
+        "score": [0.5, 0.6],
+        "fold_id": [1, 1],
+        "train_end_date": ["2018-12-31", "2018-12-31"]
+    })
+    valid_folds = pd.DataFrame({
+        "fold_id": [1],
+        "test_start_date": ["2019-01-02"],
+        "test_end_date": ["2019-01-03"]
+    })
+
+    # 1. 缺失 fold_metrics 报错
+    with pytest.raises(OOSArtifactMissingError):
+        adapter.validate_oos_predictions(valid_oos, fold_metrics_df=None)
+
+    # 2. 存在未知 fold_id
+    invalid_fold_oos = valid_oos.copy()
+    invalid_fold_oos.loc[1, "fold_id"] = 999
+    with pytest.raises(OOSLeakageError, match="Unknown fold_id"):
+        adapter.validate_oos_predictions(invalid_fold_oos, fold_metrics_df=valid_folds)
+
+    # 3. 存在重复 (trade_date, ts_code)
+    duplicate_oos = pd.concat([valid_oos, valid_oos.iloc[[0]]], ignore_index=True)
+    with pytest.raises(OOSLeakageError, match="Duplicate"):
+        adapter.validate_oos_predictions(duplicate_oos, fold_metrics_df=valid_folds)
+
+
+def test_backtest_binds_experiment_provider_uri():
+    """
+    P1-3: 验证 Backtest 严格绑定 metadata.json 中的 provider_uri 并传递给 run_qlib_backtest
+    """
+    from ashare_quant.backtest.qlib_engine import QlibEngineAdapter
+    from click.testing import CliRunner
+    from ashare_quant.cli import cli
+    from unittest.mock import patch, MagicMock
+
+    runner = CliRunner()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        exp_dir = Path("experiments") / "test_bind_provider_exp"
+        exp_dir.mkdir(parents=True, exist_ok=True)
+
+        meta = {
+            "feature_set": "alpha158",
+            "provider_uri": "C:/fake/custom/provider_uri"
+        }
+        (exp_dir / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
+
+        oos_df = pd.DataFrame({
+            "trade_date": ["2019-01-02"],
+            "ts_code": ["600000.SH"],
+            "score": [0.5],
+            "fold_id": [1],
+            "train_end_date": ["2018-12-31"]
+        })
+        oos_df.to_parquet(exp_dir / "oos_predictions.parquet")
+
+        fold_df = pd.DataFrame({
+            "fold_id": [1],
+            "test_start_date": ["2019-01-02"],
+            "test_end_date": ["2019-01-02"]
+        })
+        fold_df.to_parquet(exp_dir / "fold_metrics.parquet")
+
+        try:
+            with patch("ashare_quant.data.qlib_exporter.QlibDataProviderManager.init_qlib") as mock_init:
+                with patch.object(QlibEngineAdapter, "run_qlib_backtest", return_value=(pd.DataFrame({"return": [0.01]}), {"portfolio_annualized_return": 0.1})) as mock_bt:
+                    res = runner.invoke(cli, ["backtest", "--experiment", "test_bind_provider_exp"])
+                    assert res.exit_code == 0
+                    # 验证 run_qlib_backtest 确实收到 metadata 里的 provider_uri
+                    mock_bt.assert_called_once()
+                    assert mock_bt.call_args.kwargs.get("provider_uri") == "C:/fake/custom/provider_uri"
+        finally:
+            shutil.rmtree(exp_dir, ignore_errors=True)
+
+
+def test_qlib_status_factor_coverage():
+    """
+    P1-1: 验证 qlib-status 返回详尽的 CSI300 factor coverage 统计
+    """
+    from ashare_quant.data.qlib_exporter import get_qlib_provider_status
+    status = get_qlib_provider_status()
+    assert "factor_coverage_count" in status
+    assert "factor_expected_count" in status
+    assert "factor_coverage_pct" in status
+    assert isinstance(status["factor_coverage_pct"], float)
+    assert status["factor_coverage_pct"] >= 0.0
+
+
+def test_update_qlib_data_cli_exit_code():
+    """
+    P0-3: 验证未配置自动更新时，update-qlib-data 命令明确 exit 1 并输出指引
     """
     from click.testing import CliRunner
     from ashare_quant.cli import cli
 
     runner = CliRunner()
-    res_status = runner.invoke(cli, ["qlib-status"])
-    assert res_status.exit_code == 0
-    assert "Provider URI" in res_status.output
-    assert "Status" in res_status.output
-
-    res_update = runner.invoke(cli, ["update-qlib-data"])
-    assert res_update.exit_code == 0
-    assert "DumpDataAll" in res_update.output
+    res = runner.invoke(cli, ["update-qlib-data"])
+    assert res.exit_code != 0
+    assert "AUTOMATIC UPDATE NOT CONFIGURED" in res.output
+    assert "scripts/get_data.py" in res.output
+    assert "scripts/dump_bin.py" in res.output
 
 
 # ======================= Integration Tests =======================

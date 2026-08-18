@@ -14,7 +14,11 @@ import numpy as np
 from ashare_quant.data.processor import DataProcessor
 from ashare_quant.data.processor import DataProcessor
 from ashare_quant.data.symbols import from_qlib_symbol, to_qlib_symbol
-from ashare_quant.data.qlib_exporter import QlibDataProviderManager, get_expected_latest_completed_trade_date
+from ashare_quant.data.qlib_exporter import (
+    QlibDataProviderManager,
+    get_expected_latest_completed_trade_date,
+    MarketCalendarUnavailableError
+)
 from ashare_quant.features.custom12 import Custom12Factors, FACTOR_NAMES_12
 from ashare_quant.features.qlib_alpha158 import OfficialQlibAlpha158
 from ashare_quant.universe.filter import build_custom12_universe
@@ -159,9 +163,6 @@ class DailySignalPipeline:
         feature_set = meta.get("feature_set", "custom12")
         feature_cols = meta.get("feature_cols", FACTOR_NAMES_12)
 
-        # 获取预期最新已完成结算的市场交易日
-        expected_latest_market_date = get_expected_latest_completed_trade_date()
-
         # 2. 根据 feature_set 分发执行
         if feature_set == "alpha158":
             # ===== Qlib Alpha158 Pipeline =====
@@ -174,6 +175,7 @@ class DailySignalPipeline:
 
             # Provider Freshness Guard: 校验 Provider 是否过期
             if target_date is None:
+                expected_latest_market_date = get_expected_latest_completed_trade_date()
                 if provider_data_end_date < expected_latest_market_date:
                     raise StaleMarketDataError(
                         f"Qlib provider market data is STALE! Expected latest completed market date: '{expected_latest_market_date}', "
@@ -251,6 +253,7 @@ class DailySignalPipeline:
 
             # Freshness Guard: 校验 Custom12 数据是否过期
             if target_date is None:
+                expected_latest_market_date = get_expected_latest_completed_trade_date()
                 if custom_data_end_date < expected_latest_market_date:
                     raise StaleMarketDataError(
                         f"Daily market data is STALE! Expected latest completed market date: '{expected_latest_market_date}', "

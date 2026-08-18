@@ -262,7 +262,7 @@ def backtest(experiment, config):
     if not exp_dir.exists():
         raise RuntimeError(f"ERROR: Experiment directory '{exp_dir}' not found.")
 
-    # 严格只加载 oos_predictions.parquet；predictions.parquet 不再允许进入回测
+    # 严格只加载 oos_predictions.parquet 与 fold_metrics.parquet
     oos_pred_path = exp_dir / "oos_predictions.parquet"
     if not oos_pred_path.exists():
         raise BacktestOOSMissingError(
@@ -271,13 +271,19 @@ def backtest(experiment, config):
             f"The legacy predictions.parquet is no longer accepted."
         )
 
+    fold_metrics_path = exp_dir / "fold_metrics.parquet"
+    if not fold_metrics_path.exists():
+        raise BacktestOOSMissingError(
+            f"Fold metrics artifact not found at '{fold_metrics_path}'. "
+            f"Both oos_predictions.parquet and fold_metrics.parquet are strictly required for backtest."
+        )
+
     oos_preds_df = pd.read_parquet(oos_pred_path)
     if oos_preds_df.empty or "score" not in oos_preds_df.columns:
         raise RuntimeError("ERROR: OOS predictions file is empty or missing 'score'.")
 
     # 严格检验 OOS 预测集内容 (trade_date > train_end_date, 范围与 fold_metrics 一致)
-    fold_metrics_path = exp_dir / "fold_metrics.parquet"
-    fold_metrics_df = pd.read_parquet(fold_metrics_path) if fold_metrics_path.exists() else None
+    fold_metrics_df = pd.read_parquet(fold_metrics_path)
     engine = QlibEngineAdapter()
     engine.validate_oos_predictions(oos_preds_df, fold_metrics_df=fold_metrics_df)
 
@@ -370,7 +376,7 @@ def daily_signal(date):
 @cli.command("qlib-status")
 @click.option("--provider-uri", default=None, help="Qlib Provider 路径 (默认 ~/.qlib/qlib_data/cn_data)")
 def qlib_status(provider_uri):
-    """查看 Qlib Provider 数据状态、新鲜度与就绪情况 (READY / STALE / BROKEN)"""
+    """查看 Qlib Provider 数据状态、新鲜度与就绪情况 (READY / STALE / BROKEN / UNKNOWN)"""
     from ashare_quant.data.qlib_exporter import get_qlib_provider_status
     status_info = get_qlib_provider_status(provider_uri=provider_uri)
 
@@ -382,33 +388,65 @@ def qlib_status(provider_uri):
     click.echo(f"Trading Days Range          : {status_info['calendar_start']} -> {status_info['calendar_end']} ({status_info['total_trading_days']} days)")
     click.echo(f"Benchmark (SH000300) Ready  : {'YES' if status_info['benchmark_available'] else 'NO (MISSING)'}")
     click.echo(f"CSI300 Instruments Ready    : {'YES' if status_info['csi300_available'] else 'NO (MISSING)'}")
-    click.echo(f"Factor Features Ready       : {'YES' if status_info['factor_available'] else 'NO (MISSING)'}")
+    cov_str = f"{status_info['factor_coverage_count']}/{status_info['factor_expected_count']} ({status_info['factor_coverage_pct']}%)"
+    click.echo(f"Factor Coverage (CSI300)    : {cov_str}")
+    if status_info.get("missing_factor_examples"):
+        click.echo(f"Missing Factor Examples     : {status_info['missing_factor_examples']}")
     click.echo(f"Expected Latest Market Date : {status_info['expected_latest_market_date']}")
     click.echo(f"Status Message              : {status_info['status_message']}")
     click.echo("=======================================================\n")
 
 
 @cli.command("update-qlib-data")
+@click.option("--qlib-repo", default=None, help="Microsoft Qlib 官方仓库本地克隆路径")
 @click.option("--target-dir", default=None, help="目标 Qlib 数据目录 (默认 ~/.qlib/qlib_data/cn_data)")
 @click.option("--region", default="cn", help="市场区域 (默认 cn)")
-def update_qlib_data(target_dir, region):
+def update_qlib_data(qlib_repo, target_dir, region):
     """更新 Microsoft Qlib 官方二进制数据 (严格调用官方 collector / dump_bin 流程)"""
+    import subprocess
+    import sys
+    from ashare_quant.data.qlib_exporter import get_qlib_provider_status
+
     target = target_dir or str(Path("~/.qlib/qlib_data/cn_data").expanduser())
 
-    click.echo("\n=======================================================")
-    click.echo("Microsoft Qlib 官方数据更新入口")
-    click.echo("-------------------------------------------------------")
-    click.echo("本系统严格遵循 Microsoft Qlib 官方二进制 dump 规范，严禁私自构建 .bin 协议。")
-    click.echo(f"目标 Provider 路径: {target}")
-    click.echo("-------------------------------------------------------")
-    click.echo("标准官方数据更新命令：")
-    click.echo(f"1. 从公开数据源自动下载最新 Qlib CN 数据集:")
-    click.echo(f"   python -m qlib.run.get_data qlib_data --target_dir {target} --region {region}")
-    click.echo(f"\n2. 将自有清洗后 CSV (含 open_adj, close_adj, adj_factor) 转为 Qlib 格式:")
-    click.echo(f"   python -m qlib.dump_bin DumpDataAll --csv_path data/qlib_csv --qlib_dir {target} --include_fields open,high,low,close,volume,factor,change")
-    click.echo("-------------------------------------------------------")
-    click.echo("提示: 如需更新 custom Parquet/DuckDB，请使用 'ashare-quant update-data'。")
-    click.echo("=======================================================\n")
+    if qlib_repo:
+        repo_path = Path(qlib_repo).expanduser().resolve()
+        get_data_script = repo_path / "scripts" / "get_data.py"
+        dump_bin_script = repo_path / "scripts" / "dump_bin.py"
+
+        if not get_data_script.exists() or not dump_bin_script.exists():
+            click.echo(f"\n[ERROR] Invalid Qlib repo path: '{repo_path}'.", err=True)
+            click.echo(f"Expected official scripts: '{get_data_script}' and '{dump_bin_script}'.", err=True)
+            sys.exit(1)
+
+        click.echo(f"\nExecuting official Qlib get_data script from: {get_data_script}...")
+        cmd = [sys.executable, str(get_data_script), "qlib_data", "--target_dir", target, "--region", region]
+        res = subprocess.run(cmd)
+        if res.returncode != 0:
+            click.echo(f"\n[ERROR] Qlib get_data script failed with return code {res.returncode}.", err=True)
+            sys.exit(res.returncode)
+
+        # 验证更新后的数据健康度
+        status = get_qlib_provider_status(provider_uri=target)
+        if status["status"] in ("READY", "STALE"):
+            click.echo(f"\n[SUCCESS] Qlib provider data updated successfully. Status: {status['status']}")
+            sys.exit(0)
+        else:
+            click.echo(f"\n[ERROR] Qlib provider update completed but status check failed: {status['status_message']}", err=True)
+            sys.exit(1)
+    else:
+        click.echo("\n=======================================================")
+        click.echo("AUTOMATIC UPDATE NOT CONFIGURED")
+        click.echo("-------------------------------------------------------")
+        click.echo("To automatically execute official Qlib data download, please provide --qlib-repo:")
+        click.echo(f"  ashare-quant update-qlib-data --qlib-repo /path/to/microsoft/qlib --target-dir {target} --region {region}")
+        click.echo("\nOr manually execute the verified Microsoft Qlib scripts:")
+        click.echo(f"1. Download official CN dataset:")
+        click.echo(f"   python scripts/get_data.py qlib_data --target_dir {target} --region {region}")
+        click.echo(f"\n2. Dump preprocessed CSV into Qlib binary format:")
+        click.echo(f"   python scripts/dump_bin.py dump_all --csv_path data/qlib_csv --qlib_dir {target} --include_fields open,high,low,close,volume,factor")
+        click.echo("=======================================================\n")
+        sys.exit(1)
 
 
 @cli.command("report")

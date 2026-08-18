@@ -7,9 +7,9 @@ import os
 import shutil
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List
 import pandas as pd
-from pandas.tseries.offsets import BDay
 import numpy as np
 import qlib
 from qlib.constant import REG_CN
@@ -30,16 +30,32 @@ class DataSchemaError(ValueError):
     """Raised when required adjusted price columns are missing for export."""
     pass
 
+class MarketCalendarUnavailableError(RuntimeError):
+    """Raised when an authentic market trading calendar covering current date is unavailable."""
+    pass
+
 def get_expected_latest_completed_trade_date(reference_time: Optional[datetime] = None) -> str:
     """
     计算当前预期最新已完成结算的 A 股交易日 (YYYY-MM-DD)。
-    如果在交易日 15:30 之前，则为上一个交易日；如果已过 15:30，则为当日。
+    严格使用 Asia/Shanghai 时区。
+    若未过 15:30，预期为上一个交易日；若已过 15:30，预期为当日（若当日为交易日）或此前最近一个交易日。
+    禁止使用 pandas BDay 猜测（无法识别中国法定节假日）。
+    若本地 cached trade_calendar 未覆盖当前日期，且无可用实时日历数据源，抛出 MarketCalendarUnavailableError。
     """
-    now = reference_time or datetime.now()
-    # A股 15:00 收盘，15:30 结算完毕
+    shanghai_tz = ZoneInfo("Asia/Shanghai")
+    if reference_time is None:
+        now = datetime.now(shanghai_tz)
+    else:
+        if reference_time.tzinfo is None:
+            now = reference_time.replace(tzinfo=shanghai_tz)
+        else:
+            now = reference_time.astimezone(shanghai_tz)
+
+    today_str = now.strftime("%Y-%m-%d")
     is_after_market_close = (now.hour > 15) or (now.hour == 15 and now.minute >= 30)
 
-    # 优先从 storage 的 trade_calendar 获取
+    # 尝试从 storage 加载 trade_calendar
+    df_cal = None
     try:
         from ashare_quant.data.processor import DataProcessor
         proc = DataProcessor()
@@ -47,27 +63,58 @@ def get_expected_latest_completed_trade_date(reference_time: Optional[datetime] 
             df_cal = proc.storage.load_parquet("trade_calendar", is_processed=True)
         finally:
             proc.close()
-        if df_cal is not None and not df_cal.empty and "trade_date" in df_cal.columns:
-            today_str = now.strftime("%Y-%m-%d")
-            if is_after_market_close:
-                valid_dates = df_cal[df_cal["trade_date"] <= today_str]["trade_date"].tolist()
-            else:
-                valid_dates = df_cal[df_cal["trade_date"] < today_str]["trade_date"].tolist()
-            if valid_dates:
-                return str(sorted(valid_dates)[-1])
     except Exception:
         pass
 
-    # Fallback: 使用工作日计算
-    if is_after_market_close and now.weekday() < 5:
-        return now.strftime("%Y-%m-%d")
+    cal_coverage_end = None
+    if df_cal is not None and not df_cal.empty and "trade_date" in df_cal.columns:
+        cal_coverage_end = str(df_cal["trade_date"].max())
+
+    # 若本地日历未覆盖 today，尝试从 DataFetcher 动态拉取日历
+    if cal_coverage_end is None or cal_coverage_end < today_str:
+        try:
+            from ashare_quant.data.fetcher import DataFetcher
+            fetcher = DataFetcher()
+            fresh_cal = fetcher.fetch_trade_calendar(start_date="2000-01-01", end_date=today_str)
+            if fresh_cal is not None and not fresh_cal.empty and "trade_date" in fresh_cal.columns:
+                if str(fresh_cal["trade_date"].max()) >= today_str:
+                    df_cal = fresh_cal
+                    cal_coverage_end = str(df_cal["trade_date"].max())
+        except Exception:
+            pass
+
+    # 严格检验日历覆盖范围：禁止猜测交易日
+    if df_cal is None or df_cal.empty or cal_coverage_end is None or cal_coverage_end < today_str:
+        raise MarketCalendarUnavailableError(
+            f"MarketCalendarUnavailableError: Reliable trading calendar covering current date '{today_str}' is unavailable. "
+            f"Cached calendar ends at '{cal_coverage_end or 'None'}'. Guessing trade dates via weekday/BDay is forbidden."
+        )
+
+    # 过滤开市交易日
+    if "is_open" in df_cal.columns:
+        open_cal = df_cal[(df_cal["is_open"] == 1) | (df_cal["is_open"] == True) | (df_cal["is_open"] == "1")]
     else:
-        prev_bday = now - BDay(1)
-        return prev_bday.strftime("%Y-%m-%d")
+        open_cal = df_cal
+
+    open_dates = [str(d) for d in open_cal["trade_date"].dropna().unique()]
+    open_dates = sorted(open_dates)
+
+    if is_after_market_close:
+        valid_dates = [d for d in open_dates if d <= today_str]
+    else:
+        valid_dates = [d for d in open_dates if d < today_str]
+
+    if not valid_dates:
+        raise MarketCalendarUnavailableError(
+            f"MarketCalendarUnavailableError: No completed trading dates found before or on '{today_str}' in market calendar."
+        )
+
+    return str(valid_dates[-1])
 
 def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, Any]:
     """
-    检查指定或默认 Qlib Provider 的真实就绪与新鲜度状态 (READY / STALE / BROKEN)
+    检查指定或默认 Qlib Provider 的真实就绪与新鲜度状态 (READY / STALE / BROKEN / UNKNOWN)
+    严格检查 CSI300 标的池的 factor coverage，严禁 10 只有 1 只就判断 READY。
     """
     if provider_uri is None:
         provider_uri = str(Path("~/.qlib/qlib_data/cn_data").expanduser())
@@ -79,7 +126,15 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
     features_dir = p / "features"
     benchmark_dir = features_dir / "sh000300"
 
-    expected_market_date = get_expected_latest_completed_trade_date()
+    # 预期最新交易日 (独立日历检查)
+    expected_market_date = None
+    calendar_error = None
+    try:
+        expected_market_date = get_expected_latest_completed_trade_date()
+    except MarketCalendarUnavailableError as e:
+        calendar_error = str(e)
+    except Exception as e:
+        calendar_error = f"Calendar check error: {e}"
 
     if not p.exists() or not cal_file.exists() or not all_inst_file.exists() or not features_dir.exists():
         return {
@@ -90,8 +145,11 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
             "total_trading_days": 0,
             "benchmark_available": False,
             "csi300_available": False,
-            "factor_available": False,
-            "expected_latest_market_date": expected_market_date,
+            "factor_coverage_count": 0,
+            "factor_expected_count": 0,
+            "factor_coverage_pct": 0.0,
+            "missing_factor_examples": [],
+            "expected_latest_market_date": expected_market_date or "UNAVAILABLE",
             "status_message": f"Provider directory '{p}' is missing or incomplete."
         }
 
@@ -103,19 +161,54 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
     benchmark_avail = benchmark_dir.exists() and (benchmark_dir / "close.day.bin").exists()
     csi300_avail = csi300_file.exists()
 
-    # 检查 factor.day.bin 是否存在
-    sample_stocks = [d for d in features_dir.iterdir() if d.is_dir() and not d.name.startswith("sh000300")]
-    factor_avail = any((s / "factor.day.bin").exists() for s in sample_stocks[:10])
+    # 严格检查 CSI300 constituent universe 的 factor coverage
+    csi300_instruments = []
+    if csi300_avail:
+        for line in csi300_file.read_text(encoding="utf-8").splitlines():
+            parts = line.strip().split()
+            if parts:
+                csi300_instruments.append(parts[0])
 
-    if not benchmark_avail or not csi300_avail or not factor_avail or total_days == 0:
+    check_universe = csi300_instruments if csi300_instruments else (
+        [line.strip().split()[0] for line in all_inst_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    )
+    stock_universe = [inst for inst in check_universe if not inst.lower().startswith("sh000300")]
+
+    factor_expected_count = len(stock_universe)
+    missing_factors = []
+    factor_coverage_count = 0
+    for inst in stock_universe:
+        inst_feat = features_dir / inst.lower()
+        if not inst_feat.exists():
+            inst_feat = features_dir / inst
+        if inst_feat.exists() and (inst_feat / "factor.day.bin").exists():
+            factor_coverage_count += 1
+        else:
+            missing_factors.append(inst)
+
+    factor_coverage_pct = round(factor_coverage_count / factor_expected_count * 100.0, 2) if factor_expected_count > 0 else 0.0
+
+    if not benchmark_avail or not csi300_avail or total_days == 0 or factor_coverage_pct < 100.0:
         status = "BROKEN"
-        msg = "Provider is missing benchmark, csi300 instruments, or factor feature bins."
-    elif cal_end < expected_market_date:
+        reasons = []
+        if not benchmark_avail:
+            reasons.append("Missing benchmark (SH000300)")
+        if not csi300_avail:
+            reasons.append("Missing csi300.txt")
+        if total_days == 0:
+            reasons.append("Empty trading calendar")
+        if factor_coverage_pct < 100.0:
+            reasons.append(f"Incomplete factor coverage: {factor_coverage_count}/{factor_expected_count} ({factor_coverage_pct}%)")
+        msg = f"Provider is BROKEN: {', '.join(reasons)}."
+    elif calendar_error is not None:
+        status = "UNKNOWN"
+        msg = f"Market calendar unavailable to determine freshness: {calendar_error}"
+    elif expected_market_date and cal_end < expected_market_date:
         status = "STALE"
         msg = f"Provider data ends at '{cal_end}', older than expected market date '{expected_market_date}'."
     else:
         status = "READY"
-        msg = "Provider data is complete, benchmark ready, and fully up-to-date."
+        msg = f"Provider data is complete ({factor_coverage_count}/{factor_expected_count} factors), benchmark ready, and fully up-to-date."
 
     return {
         "provider_uri": str(p),
@@ -125,8 +218,11 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
         "total_trading_days": total_days,
         "benchmark_available": benchmark_avail,
         "csi300_available": csi300_avail,
-        "factor_available": factor_avail,
-        "expected_latest_market_date": expected_market_date,
+        "factor_coverage_count": factor_coverage_count,
+        "factor_expected_count": factor_expected_count,
+        "factor_coverage_pct": factor_coverage_pct,
+        "missing_factor_examples": missing_factors[:5],
+        "expected_latest_market_date": expected_market_date or "UNAVAILABLE",
         "status_message": msg
     }
 
