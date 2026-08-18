@@ -390,8 +390,8 @@ def qlib_status(provider_uri):
     click.echo(f"CSI300 Instruments Ready    : {'YES' if status_info['csi300_available'] else 'NO (MISSING)'}")
     click.echo(f"CSI300 Membership Range     : Max End = {status_info.get('csi300_membership_max_end', 'N/A')} (Total: {status_info.get('csi300_member_count', 0)} instruments)")
     click.echo(f"CSI300 Active on Latest Date: {status_info.get('csi300_active_count_on_expected_date', 0)} (Fresh: {'YES' if status_info.get('csi300_membership_fresh') else 'NO'})")
-    cov_str = f"{status_info['factor_coverage_count']}/{status_info['factor_expected_count']} ({status_info['factor_coverage_pct']}%)"
-    click.echo(f"Factor Coverage (CSI300)    : {cov_str}")
+    click.echo(f"Active Factor Coverage (CSI300) : {status_info.get('active_factor_coverage', 'N/A')}")
+    click.echo(f"Historical Factor Coverage (All): {status_info.get('historical_factor_coverage', 'N/A')}")
     if status_info.get("missing_factor_examples"):
         click.echo(f"Missing Factor Examples     : {status_info['missing_factor_examples']}")
     click.echo(f"Expected Latest Market Date : {status_info['expected_latest_market_date']}")

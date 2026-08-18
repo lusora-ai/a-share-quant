@@ -17,7 +17,9 @@ from ashare_quant.data.symbols import from_qlib_symbol, to_qlib_symbol
 from ashare_quant.data.qlib_exporter import (
     QlibDataProviderManager,
     get_expected_latest_completed_trade_date,
-    MarketCalendarUnavailableError
+    MarketCalendarUnavailableError,
+    DataSchemaError,
+    QlibDataNotReadyError
 )
 from ashare_quant.features.custom12 import Custom12Factors, FACTOR_NAMES_12
 from ashare_quant.features.qlib_alpha158 import OfficialQlibAlpha158
@@ -175,16 +177,19 @@ class DailySignalPipeline:
 
             # CSI300 Point-in-Time Membership 解析
             csi300_file = Path(resolved_uri) / "instruments" / "csi300.txt"
-            if not csi300_file.exists():
-                raise FileNotFoundError(f"Missing required Qlib CSI300 instruments file: '{csi300_file}'")
-
             membership_records = []
-            for line in csi300_file.read_text(encoding="utf-8").splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 3:
+            for line_no, line in enumerate(csi300_file.read_text(encoding="utf-8").splitlines(), 1):
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                parts = line_str.split()
+                if len(parts) == 3:
                     membership_records.append((parts[0], parts[1], parts[2]))
-                elif len(parts) >= 1:
-                    membership_records.append((parts[0], "2000-01-01", "2099-12-31"))
+                else:
+                    raise DataSchemaError(
+                        f"DataSchemaError: Malformed record in '{csi300_file}' at line {line_no}: '{line_str}'. "
+                        f"Each line must have exactly 3 fields: 'instrument start_date end_date'."
+                    )
 
             max_membership_end = max((r[2] for r in membership_records), default="N/A")
 

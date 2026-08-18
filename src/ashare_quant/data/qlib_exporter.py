@@ -38,11 +38,10 @@ def get_expected_latest_completed_trade_date(reference_time: Optional[datetime] 
     """
     计算当前预期最新已完成结算的 A 股交易日 (YYYY-MM-DD)。
     严格使用 Asia/Shanghai 时区。
+    优先使用 exchange_calendars (XSHG) 官方交易日历作为 2026 production source of truth。
     若未过 15:30，预期为上一个交易日；若已过 15:30，预期为当日（若当日为交易日）或此前最近一个交易日。
     禁止使用 pandas BDay 猜测（无法识别中国法定节假日）。
-    若本地 cached trade_calendar 未覆盖当前日期附近的真实交易日 schedule，
-    且无法从可靠日历数据源拉取到证明覆盖当前日期的真实日历（即包含当前日期之后的已知交易日），
-    抛出 MarketCalendarUnavailableError。
+    若日历数据源不可用或未覆盖当前日期，抛出 MarketCalendarUnavailableError。
     """
     shanghai_tz = ZoneInfo("Asia/Shanghai")
     if reference_time is None:
@@ -56,18 +55,20 @@ def get_expected_latest_completed_trade_date(reference_time: Optional[datetime] 
     today_str = now.strftime("%Y-%m-%d")
     is_after_market_close = (now.hour > 15) or (now.hour == 15 and now.minute >= 30)
 
-    # 尝试从 storage 加载 trade_calendar
-    df_cal = None
-    try:
-        from ashare_quant.data.processor import DataProcessor
-        proc = DataProcessor()
-        try:
-            df_cal = proc.storage.load_parquet("trade_calendar", is_processed=True)
-        finally:
-            proc.close()
-    except Exception:
-        pass
+    open_dates = []
 
+    # 1. 优先使用 exchange_calendars ("XSHG")
+    try:
+        import exchange_calendars as xcals
+        cal = xcals.get_calendar("XSHG")
+        start_d = (now - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+        end_d = (now + pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+        sessions = cal.sessions_in_range(start_d, end_d)
+        open_dates = sorted([s.strftime("%Y-%m-%d") for s in sessions])
+    except Exception:
+        open_dates = []
+
+    # 2. 若 exchange_calendars 异常或未覆盖，回退检查 local storage 或 DataFetcher (用于单元测试 mock 或离线环境)
     def extract_open_dates(df: Optional[pd.DataFrame]) -> List[str]:
         if df is None or df.empty or "trade_date" not in df.columns:
             return []
@@ -76,11 +77,21 @@ def get_expected_latest_completed_trade_date(reference_time: Optional[datetime] 
             return sorted([str(d) for d in valid["trade_date"].dropna().unique()])
         return sorted([str(d) for d in df["trade_date"].dropna().unique()])
 
-    open_dates = extract_open_dates(df_cal)
-    has_future_dates = any(d > today_str for d in open_dates)
+    if not open_dates or not any(d > today_str for d in open_dates):
+        try:
+            from ashare_quant.data.processor import DataProcessor
+            proc = DataProcessor()
+            try:
+                df_cal = proc.storage.load_parquet("trade_calendar", is_processed=True)
+                storage_dates = extract_open_dates(df_cal)
+                if any(d > today_str for d in storage_dates):
+                    open_dates = storage_dates
+            finally:
+                proc.close()
+        except Exception:
+            pass
 
-    # 若本地日历无法证明覆盖 today，尝试从 DataFetcher 动态拉取前后窗口 (today - 45d ~ today + 45d)
-    if not has_future_dates:
+    if not open_dates or not any(d > today_str for d in open_dates):
         try:
             from ashare_quant.data.fetcher import DataFetcher
             fetcher = DataFetcher()
@@ -90,11 +101,11 @@ def get_expected_latest_completed_trade_date(reference_time: Optional[datetime] 
             fresh_open_dates = extract_open_dates(fresh_cal)
             if any(d > today_str for d in fresh_open_dates):
                 open_dates = fresh_open_dates
-                has_future_dates = True
         except Exception:
             pass
 
     # 严格检验日历覆盖范围：禁止猜测交易日
+    has_future_dates = any(d > today_str for d in open_dates) if open_dates else False
     if not open_dates or not has_future_dates:
         cal_max = max(open_dates) if open_dates else "None"
         raise MarketCalendarUnavailableError(
@@ -129,7 +140,14 @@ def get_expected_latest_completed_trade_date(reference_time: Optional[datetime] 
 def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, Any]:
     """
     检查指定或默认 Qlib Provider 的真实就绪与新鲜度状态 (READY / STALE / BROKEN / UNKNOWN)
-    严格检查 CSI300 标的池的 factor coverage，严禁 10 只有 1 只就判断 READY。
+    严格检查 active CSI300 标的池的 factor coverage，严禁伪造。
+    状态判定优先级：
+      1. provider structure broken -> BROKEN
+      2. market calendar unavailable -> UNKNOWN
+      3. market data old (calendar_end < expected_date) -> STALE
+      4. membership malformed / stale / abnormal count -> BROKEN
+      5. active factor incomplete -> BROKEN
+      6. all checks passed -> READY
     """
     if provider_uri is None:
         provider_uri = str(Path("~/.qlib/qlib_data/cn_data").expanduser())
@@ -167,6 +185,8 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
             "factor_coverage_count": 0,
             "factor_expected_count": 0,
             "factor_coverage_pct": 0.0,
+            "historical_factor_coverage": "0/0 (0.0%)",
+            "active_factor_coverage": "0/0 (0.0%)",
             "missing_factor_examples": [],
             "expected_latest_market_date": expected_market_date or "UNAVAILABLE",
             "status_message": f"Provider directory '{p}' is missing or incomplete."
@@ -180,81 +200,117 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
     benchmark_avail = benchmark_dir.exists() and (benchmark_dir / "close.day.bin").exists()
     csi300_avail = csi300_file.exists()
 
-    # 解析 instruments/csi300.txt 的 Point-in-Time membership 数据
+    # 解析 instruments/csi300.txt 的 Point-in-Time membership 数据（严格禁止 fake fallback）
     csi300_records = []
     csi300_instruments = []
+    csi300_malformed = False
+    malformed_examples = []
     if csi300_avail:
-        for line in csi300_file.read_text(encoding="utf-8").splitlines():
-            parts = line.strip().split()
-            if len(parts) >= 3:
+        for line_no, line in enumerate(csi300_file.read_text(encoding="utf-8").splitlines(), 1):
+            line_str = line.strip()
+            if not line_str:
+                continue
+            parts = line_str.split()
+            if len(parts) == 3:
                 csi300_records.append((parts[0], parts[1], parts[2]))
                 csi300_instruments.append(parts[0])
-            elif len(parts) >= 1:
-                csi300_records.append((parts[0], "2000-01-01", "2099-12-31"))
-                csi300_instruments.append(parts[0])
+            else:
+                csi300_malformed = True
+                malformed_examples.append(f"line {line_no}: '{line_str}'")
 
     unique_csi300_members = list(dict.fromkeys(csi300_instruments))
     csi300_member_count = len(unique_csi300_members)
     membership_max_end = max((r[2] for r in csi300_records), default="N/A")
 
     active_count_on_expected = 0
+    active_constituents = []
     membership_fresh = False
-    if expected_market_date and expected_market_date != "UNAVAILABLE" and csi300_records:
-        active_members = set(
+    if expected_market_date and expected_market_date != "UNAVAILABLE" and csi300_records and not csi300_malformed:
+        active_constituents = list(dict.fromkeys(
             r[0] for r in csi300_records if r[1] <= expected_market_date <= r[2]
-        )
-        active_count_on_expected = len(active_members)
+        ))
+        active_count_on_expected = len(active_constituents)
         if membership_max_end != "N/A" and membership_max_end >= expected_market_date and 280 <= active_count_on_expected <= 320:
             membership_fresh = True
 
-    # 严格检查 CSI300 constituent universe 的 factor coverage
-    check_universe = unique_csi300_members if unique_csi300_members else (
+    # 1. 历史全量标的 factor coverage (报告指标)
+    check_hist_universe = unique_csi300_members if unique_csi300_members else (
         [line.strip().split()[0] for line in all_inst_file.read_text(encoding="utf-8").splitlines() if line.strip()]
     )
-    stock_universe = [inst for inst in check_universe if not inst.lower().startswith("sh000300")]
-
-    factor_expected_count = len(stock_universe)
-    missing_factors = []
-    factor_coverage_count = 0
-    for inst in stock_universe:
+    hist_stock_universe = [inst for inst in check_hist_universe if not inst.lower().startswith("sh000300")]
+    hist_expected_count = len(hist_stock_universe)
+    hist_covered_count = 0
+    missing_hist_factors = []
+    for inst in hist_stock_universe:
         inst_feat = features_dir / inst.lower()
         if not inst_feat.exists():
             inst_feat = features_dir / inst
         if inst_feat.exists() and (inst_feat / "factor.day.bin").exists():
-            factor_coverage_count += 1
+            hist_covered_count += 1
         else:
-            missing_factors.append(inst)
+            missing_hist_factors.append(inst)
+    historical_factor_coverage_pct = round(hist_covered_count / hist_expected_count * 100.0, 2) if hist_expected_count > 0 else 0.0
+    historical_factor_coverage = f"{hist_covered_count}/{hist_expected_count} ({historical_factor_coverage_pct}%)"
 
-    factor_coverage_pct = round(factor_coverage_count / factor_expected_count * 100.0, 2) if factor_expected_count > 0 else 0.0
+    # 2. 当日 active constituent factor coverage (作为 READY 生产条件)
+    active_stock_universe = [inst for inst in active_constituents if not inst.lower().startswith("sh000300")]
+    active_expected_count = len(active_stock_universe)
+    active_covered_count = 0
+    missing_active_factors = []
+    for inst in active_stock_universe:
+        inst_feat = features_dir / inst.lower()
+        if not inst_feat.exists():
+            inst_feat = features_dir / inst
+        if inst_feat.exists() and (inst_feat / "factor.day.bin").exists():
+            active_covered_count += 1
+        else:
+            missing_active_factors.append(inst)
+    active_factor_coverage_pct = round(active_covered_count / active_expected_count * 100.0, 2) if active_expected_count > 0 else 0.0
+    active_factor_coverage = f"{active_covered_count}/{active_expected_count} ({active_factor_coverage_pct}%)"
 
-    if not benchmark_avail or not csi300_avail or total_days == 0 or factor_coverage_pct < 100.0 or not membership_fresh:
+    # 严格按优先级判定状态
+    # 1. 结构完整性检查 -> BROKEN
+    struct_reasons = []
+    if not benchmark_avail:
+        struct_reasons.append("Missing benchmark (SH000300)")
+    if not csi300_avail:
+        struct_reasons.append("Missing csi300.txt")
+    if total_days == 0:
+        struct_reasons.append("Empty trading calendar")
+    if struct_reasons:
         status = "BROKEN"
-        reasons = []
-        if not benchmark_avail:
-            reasons.append("Missing benchmark (SH000300)")
-        if not csi300_avail:
-            reasons.append("Missing csi300.txt")
-        if total_days == 0:
-            reasons.append("Empty trading calendar")
-        if factor_coverage_pct < 100.0:
-            reasons.append(f"Incomplete factor coverage: {factor_coverage_count}/{factor_expected_count} ({factor_coverage_pct}%)")
-        if csi300_avail and not membership_fresh:
-            if expected_market_date is None or expected_market_date == "UNAVAILABLE":
-                reasons.append("Market calendar unavailable to determine CSI300 membership freshness")
-            elif membership_max_end < expected_market_date:
-                reasons.append(f"CSI300 instrument membership is stale (max membership end '{membership_max_end}' < expected market date '{expected_market_date}')")
-            elif active_count_on_expected < 280 or active_count_on_expected > 320:
-                reasons.append(f"Abnormal active CSI300 constituents count on {expected_market_date}: {active_count_on_expected} (expected 280~320)")
-        msg = f"Provider is BROKEN: {', '.join(reasons)}."
-    elif calendar_error is not None:
+        msg = f"Provider is BROKEN: {', '.join(struct_reasons)}."
+
+    # 2. 交易日历可用性检查 -> UNKNOWN
+    elif calendar_error is not None or expected_market_date is None or expected_market_date == "UNAVAILABLE":
         status = "UNKNOWN"
-        msg = f"Market calendar unavailable to determine freshness: {calendar_error}"
-    elif expected_market_date and cal_end < expected_market_date:
+        msg = f"Market calendar unavailable to determine freshness: {calendar_error or 'Expected market date unavailable'}"
+
+    # 3. 行情数据新鲜度检查 -> STALE
+    elif cal_end < expected_market_date:
         status = "STALE"
         msg = f"Provider data ends at '{cal_end}', older than expected market date '{expected_market_date}'."
+
+    # 4. CSI300 Point-in-Time 成员有效性与格式检查 -> BROKEN
+    elif csi300_malformed:
+        status = "BROKEN"
+        msg = f"Provider is BROKEN: Malformed records in csi300.txt (each record must have 3 fields 'instrument start_date end_date'). Examples: {malformed_examples[:3]}."
+    elif membership_max_end < expected_market_date:
+        status = "BROKEN"
+        msg = f"Provider is BROKEN: CSI300 instrument membership is stale (max membership end '{membership_max_end}' < expected market date '{expected_market_date}')."
+    elif active_count_on_expected < 280 or active_count_on_expected > 320:
+        status = "BROKEN"
+        msg = f"Provider is BROKEN: Abnormal active CSI300 constituents count on {expected_market_date}: {active_count_on_expected} (expected 280~320)."
+
+    # 5. 生产 active 标的 factor 完整性检查 -> BROKEN
+    elif active_factor_coverage_pct < 100.0:
+        status = "BROKEN"
+        msg = f"Provider is BROKEN: Incomplete active factor coverage: {active_covered_count}/{active_expected_count} ({active_factor_coverage_pct}%). Missing: {missing_active_factors[:5]}."
+
+    # 6. 全部通过 -> READY
     else:
         status = "READY"
-        msg = f"Provider data is complete ({factor_coverage_count}/{factor_expected_count} factors), benchmark ready, CSI300 membership active ({active_count_on_expected}), and fully up-to-date."
+        msg = f"Provider data is complete ({active_covered_count}/{active_expected_count} active factors), benchmark ready, CSI300 membership active ({active_count_on_expected}), and fully up-to-date."
 
     return {
         "provider_uri": str(p),
@@ -268,10 +324,12 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
         "csi300_membership_max_end": membership_max_end,
         "csi300_active_count_on_expected_date": active_count_on_expected,
         "csi300_membership_fresh": membership_fresh,
-        "factor_coverage_count": factor_coverage_count,
-        "factor_expected_count": factor_expected_count,
-        "factor_coverage_pct": factor_coverage_pct,
-        "missing_factor_examples": missing_factors[:5],
+        "factor_coverage_count": active_covered_count,
+        "factor_expected_count": active_expected_count,
+        "factor_coverage_pct": active_factor_coverage_pct,
+        "historical_factor_coverage": historical_factor_coverage,
+        "active_factor_coverage": active_factor_coverage,
+        "missing_factor_examples": (missing_active_factors or missing_hist_factors)[:5],
         "expected_latest_market_date": expected_market_date or "UNAVAILABLE",
         "status_message": msg
     }

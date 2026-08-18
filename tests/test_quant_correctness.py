@@ -483,17 +483,38 @@ def test_shanghai_timezone_instantiation():
 
 def test_freshness_check_with_stale_calendar_raises():
     """
-    验证当 cached trade calendar 过期 (如只到 2020 而 today=2026) 时，抛出 MarketCalendarUnavailableError，绝不猜测
+    验证当 trade calendar 不可用或过期 (如只到 2020 而 today=2026) 时，抛出 MarketCalendarUnavailableError，绝不猜测
     """
     from ashare_quant.data.qlib_exporter import get_expected_latest_completed_trade_date, MarketCalendarUnavailableError
     from unittest.mock import patch
 
-    # 模拟本地日历只到 2020-12-31，today 为 2026-08-18 (生产 schema: trade_date list)
+    # 模拟 exchange_calendars 与 storage 均不可用/过期
     mock_cal_df = pd.DataFrame({"trade_date": ["2020-01-02", "2020-12-31"]})
-    with patch("ashare_quant.data.storage.StorageEngine.load_parquet", return_value=mock_cal_df):
-        with patch("ashare_quant.data.fetcher.DataFetcher.fetch_trade_calendar", side_effect=Exception("No network")):
-            with pytest.raises(MarketCalendarUnavailableError, match="Reliable trading calendar"):
-                get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 18, 16, 0, 0))
+    with patch("exchange_calendars.get_calendar", side_effect=Exception("Calendar offline")):
+        with patch("ashare_quant.data.storage.StorageEngine.load_parquet", return_value=mock_cal_df):
+            with patch("ashare_quant.data.fetcher.DataFetcher.fetch_trade_calendar", side_effect=Exception("No network")):
+                with pytest.raises(MarketCalendarUnavailableError, match="Reliable trading calendar"):
+                    get_expected_latest_completed_trade_date(reference_time=datetime(2026, 8, 18, 16, 0, 0))
+
+
+def test_xshg_calendar_2026_expected_latest_trade_date():
+    """
+    验收今天日期 (2026-08-18 周二):
+    1. 15:59 (>= 15:30) Asia/Shanghai: 必须为 2026-08-18 (XSHG 真实 session)
+    2. 10:00 (< 15:30) Asia/Shanghai: 必须为 2026-08-17 (上一交易日)
+    """
+    from ashare_quant.data.qlib_exporter import get_expected_latest_completed_trade_date
+    from zoneinfo import ZoneInfo
+
+    sh_tz = ZoneInfo("Asia/Shanghai")
+
+    # 1. 15:59 -> 2026-08-18
+    dt_after = datetime(2026, 8, 18, 15, 59, 0, tzinfo=sh_tz)
+    assert get_expected_latest_completed_trade_date(reference_time=dt_after) == "2026-08-18"
+
+    # 2. 10:00 -> 2026-08-17
+    dt_before = datetime(2026, 8, 18, 10, 0, 0, tzinfo=sh_tz)
+    assert get_expected_latest_completed_trade_date(reference_time=dt_before) == "2026-08-17"
 
 
 def test_freshness_holiday_spring_festival_accurate():
@@ -978,6 +999,108 @@ def test_daily_signal_rejects_stale_csi300_membership():
                 with pytest.raises(StaleMarketDataError) as excinfo:
                     pipeline.run_daily_pipeline(target_date=None)
                 assert "CSI300 instrument membership is stale" in str(excinfo.value)
+
+
+def test_csi300_malformed_record_raises_or_broken():
+    """
+    验证 csi300.txt 存在格式错误行（缺少 start_date / end_date）时，qlib-status 判定为 BROKEN，且 DailySignalPipeline 抛出 DataSchemaError
+    """
+    from ashare_quant.data.qlib_exporter import get_qlib_provider_status, DataSchemaError
+    from ashare_quant.signals.daily import DailySignalPipeline
+    import tempfile
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p = Path(tmpdir)
+        (p / "calendars").mkdir(parents=True)
+        (p / "instruments").mkdir(parents=True)
+        (p / "features" / "sh000300").mkdir(parents=True)
+
+        (p / "calendars" / "day.txt").write_text("2026-08-18\n", encoding="utf-8")
+        (p / "features" / "sh000300" / "close.day.bin").write_bytes(b"\x00" * 8)
+
+        # 构造包含 malformed 单字段/双字段行的 csi300.txt
+        (p / "instruments" / "csi300.txt").write_text("SH600000\nSH600001 2020-01-01\n", encoding="utf-8")
+        (p / "instruments" / "all.txt").write_text("SH600000 2020-01-01 2026-12-31\n", encoding="utf-8")
+
+        with patch("ashare_quant.data.qlib_exporter.get_expected_latest_completed_trade_date", return_value="2026-08-18"):
+            status = get_qlib_provider_status(provider_uri=str(p))
+            assert status["status"] == "BROKEN"
+            assert "Malformed records in csi300.txt" in status["status_message"]
+
+        pipeline = DailySignalPipeline()
+        with patch("ashare_quant.data.qlib_exporter.QlibDataProviderManager.init_qlib", return_value=str(p)):
+            with patch("ashare_quant.signals.daily.get_expected_latest_completed_trade_date", return_value="2026-08-18"):
+                with pytest.raises(DataSchemaError, match="Malformed record"):
+                    pipeline.run_daily_pipeline(target_date=None)
+
+
+def test_factor_coverage_active_vs_historical():
+    """
+    验证 factor coverage 按 active constituents 检查：
+    当历史 2010 年退市股缺少 factor，但当日 300 只 active constituents 全部有 factor 时，
+    active_factor_coverage = 100%，status 判定为 READY
+    """
+    from ashare_quant.data.qlib_exporter import get_qlib_provider_status
+    import tempfile
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p = Path(tmpdir)
+        (p / "calendars").mkdir(parents=True)
+        (p / "instruments").mkdir(parents=True)
+        (p / "features" / "sh000300").mkdir(parents=True)
+
+        (p / "calendars" / "day.txt").write_text("2026-08-18\n", encoding="utf-8")
+        (p / "features" / "sh000300" / "close.day.bin").write_bytes(b"\x00" * 8)
+
+        # 300 只 active 股票
+        active_insts = [f"SH60{i:04d}" for i in range(300)]
+        csi_lines = [f"{inst}\t2020-01-01\t2026-12-31\n" for inst in active_insts]
+        # 1 只 2010 年退市的历史成分股
+        csi_lines.append("SH609999\t2005-01-01\t2010-01-01\n")
+
+        (p / "instruments" / "csi300.txt").write_text("".join(csi_lines), encoding="utf-8")
+        (p / "instruments" / "all.txt").write_text("".join(csi_lines), encoding="utf-8")
+
+        # 只有 300 只 active 股票有 factor.day.bin，退市股 SH609999 没有
+        for inst in active_insts:
+            inst_dir = p / "features" / inst.lower()
+            inst_dir.mkdir(parents=True)
+            (inst_dir / "factor.day.bin").write_bytes(b"\x00" * 8)
+
+        with patch("ashare_quant.data.qlib_exporter.get_expected_latest_completed_trade_date", return_value="2026-08-18"):
+            status = get_qlib_provider_status(provider_uri=str(p))
+            assert status["status"] == "READY"
+            assert status["factor_coverage_pct"] == 100.0
+            assert status["active_factor_coverage"] == "300/300 (100.0%)"
+            assert "300/301" in status["historical_factor_coverage"]
+
+
+def test_unknown_status_priority_over_broken():
+    """
+    验证当 expected_latest_market_date 无法确定时，状态必须为 UNKNOWN，而不能因为 membership_fresh=False 提前变成 BROKEN
+    """
+    from ashare_quant.data.qlib_exporter import get_qlib_provider_status, MarketCalendarUnavailableError
+    import tempfile
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p = Path(tmpdir)
+        (p / "calendars").mkdir(parents=True)
+        (p / "instruments").mkdir(parents=True)
+        (p / "features" / "sh000300").mkdir(parents=True)
+
+        (p / "calendars" / "day.txt").write_text("2026-08-18\n", encoding="utf-8")
+        (p / "features" / "sh000300" / "close.day.bin").write_bytes(b"\x00" * 8)
+        (p / "instruments" / "csi300.txt").write_text("SH600000\t2005-01-01\t2021-06-11\n", encoding="utf-8")
+        (p / "instruments" / "all.txt").write_text("SH600000\t2005-01-01\t2021-06-11\n", encoding="utf-8")
+
+        # 模拟日历不可用
+        with patch("ashare_quant.data.qlib_exporter.get_expected_latest_completed_trade_date", side_effect=MarketCalendarUnavailableError("No calendar")):
+            status = get_qlib_provider_status(provider_uri=str(p))
+            assert status["status"] == "UNKNOWN"
+            assert "Market calendar unavailable" in status["status_message"]
 
 
 # ======================= Integration Tests =======================
