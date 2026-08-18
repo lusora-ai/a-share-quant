@@ -388,6 +388,8 @@ def qlib_status(provider_uri):
     click.echo(f"Trading Days Range          : {status_info['calendar_start']} -> {status_info['calendar_end']} ({status_info['total_trading_days']} days)")
     click.echo(f"Benchmark (SH000300) Ready  : {'YES' if status_info['benchmark_available'] else 'NO (MISSING)'}")
     click.echo(f"CSI300 Instruments Ready    : {'YES' if status_info['csi300_available'] else 'NO (MISSING)'}")
+    click.echo(f"CSI300 Membership Range     : Max End = {status_info.get('csi300_membership_max_end', 'N/A')} (Total: {status_info.get('csi300_member_count', 0)} instruments)")
+    click.echo(f"CSI300 Active on Latest Date: {status_info.get('csi300_active_count_on_expected_date', 0)} (Fresh: {'YES' if status_info.get('csi300_membership_fresh') else 'NO'})")
     cov_str = f"{status_info['factor_coverage_count']}/{status_info['factor_expected_count']} ({status_info['factor_coverage_pct']}%)"
     click.echo(f"Factor Coverage (CSI300)    : {cov_str}")
     if status_info.get("missing_factor_examples"):

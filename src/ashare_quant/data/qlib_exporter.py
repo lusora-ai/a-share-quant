@@ -160,6 +160,10 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
             "total_trading_days": 0,
             "benchmark_available": False,
             "csi300_available": False,
+            "csi300_member_count": 0,
+            "csi300_membership_max_end": "N/A",
+            "csi300_active_count_on_expected_date": 0,
+            "csi300_membership_fresh": False,
             "factor_coverage_count": 0,
             "factor_expected_count": 0,
             "factor_coverage_pct": 0.0,
@@ -176,15 +180,35 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
     benchmark_avail = benchmark_dir.exists() and (benchmark_dir / "close.day.bin").exists()
     csi300_avail = csi300_file.exists()
 
-    # 严格检查 CSI300 constituent universe 的 factor coverage
+    # 解析 instruments/csi300.txt 的 Point-in-Time membership 数据
+    csi300_records = []
     csi300_instruments = []
     if csi300_avail:
         for line in csi300_file.read_text(encoding="utf-8").splitlines():
             parts = line.strip().split()
-            if parts:
+            if len(parts) >= 3:
+                csi300_records.append((parts[0], parts[1], parts[2]))
+                csi300_instruments.append(parts[0])
+            elif len(parts) >= 1:
+                csi300_records.append((parts[0], "2000-01-01", "2099-12-31"))
                 csi300_instruments.append(parts[0])
 
-    check_universe = csi300_instruments if csi300_instruments else (
+    unique_csi300_members = list(dict.fromkeys(csi300_instruments))
+    csi300_member_count = len(unique_csi300_members)
+    membership_max_end = max((r[2] for r in csi300_records), default="N/A")
+
+    active_count_on_expected = 0
+    membership_fresh = False
+    if expected_market_date and expected_market_date != "UNAVAILABLE" and csi300_records:
+        active_members = set(
+            r[0] for r in csi300_records if r[1] <= expected_market_date <= r[2]
+        )
+        active_count_on_expected = len(active_members)
+        if membership_max_end != "N/A" and membership_max_end >= expected_market_date and 280 <= active_count_on_expected <= 320:
+            membership_fresh = True
+
+    # 严格检查 CSI300 constituent universe 的 factor coverage
+    check_universe = unique_csi300_members if unique_csi300_members else (
         [line.strip().split()[0] for line in all_inst_file.read_text(encoding="utf-8").splitlines() if line.strip()]
     )
     stock_universe = [inst for inst in check_universe if not inst.lower().startswith("sh000300")]
@@ -203,7 +227,7 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
 
     factor_coverage_pct = round(factor_coverage_count / factor_expected_count * 100.0, 2) if factor_expected_count > 0 else 0.0
 
-    if not benchmark_avail or not csi300_avail or total_days == 0 or factor_coverage_pct < 100.0:
+    if not benchmark_avail or not csi300_avail or total_days == 0 or factor_coverage_pct < 100.0 or not membership_fresh:
         status = "BROKEN"
         reasons = []
         if not benchmark_avail:
@@ -214,6 +238,13 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
             reasons.append("Empty trading calendar")
         if factor_coverage_pct < 100.0:
             reasons.append(f"Incomplete factor coverage: {factor_coverage_count}/{factor_expected_count} ({factor_coverage_pct}%)")
+        if csi300_avail and not membership_fresh:
+            if expected_market_date is None or expected_market_date == "UNAVAILABLE":
+                reasons.append("Market calendar unavailable to determine CSI300 membership freshness")
+            elif membership_max_end < expected_market_date:
+                reasons.append(f"CSI300 instrument membership is stale (max membership end '{membership_max_end}' < expected market date '{expected_market_date}')")
+            elif active_count_on_expected < 280 or active_count_on_expected > 320:
+                reasons.append(f"Abnormal active CSI300 constituents count on {expected_market_date}: {active_count_on_expected} (expected 280~320)")
         msg = f"Provider is BROKEN: {', '.join(reasons)}."
     elif calendar_error is not None:
         status = "UNKNOWN"
@@ -223,7 +254,7 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
         msg = f"Provider data ends at '{cal_end}', older than expected market date '{expected_market_date}'."
     else:
         status = "READY"
-        msg = f"Provider data is complete ({factor_coverage_count}/{factor_expected_count} factors), benchmark ready, and fully up-to-date."
+        msg = f"Provider data is complete ({factor_coverage_count}/{factor_expected_count} factors), benchmark ready, CSI300 membership active ({active_count_on_expected}), and fully up-to-date."
 
     return {
         "provider_uri": str(p),
@@ -233,6 +264,10 @@ def get_qlib_provider_status(provider_uri: Optional[str] = None) -> Dict[str, An
         "total_trading_days": total_days,
         "benchmark_available": benchmark_avail,
         "csi300_available": csi300_avail,
+        "csi300_member_count": csi300_member_count,
+        "csi300_membership_max_end": membership_max_end,
+        "csi300_active_count_on_expected_date": active_count_on_expected,
+        "csi300_membership_fresh": membership_fresh,
         "factor_coverage_count": factor_coverage_count,
         "factor_expected_count": factor_expected_count,
         "factor_coverage_pct": factor_coverage_pct,

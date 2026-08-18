@@ -879,6 +879,107 @@ def test_update_qlib_data_ready_is_success():
                 assert "[SUCCESS]" in res.output
 
 
+def test_csi300_membership_stale_is_broken():
+    """
+    验证 CSI300 Point-in-Time membership 过期 (如 max end=2021-06-11 < expected=2026-08-18) 时，status 判定为 BROKEN 且错误提示 membership is stale
+    """
+    from ashare_quant.data.qlib_exporter import get_qlib_provider_status
+    import tempfile
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p = Path(tmpdir)
+        (p / "calendars").mkdir(parents=True)
+        (p / "instruments").mkdir(parents=True)
+        (p / "features" / "sh000300").mkdir(parents=True)
+
+        (p / "calendars" / "day.txt").write_text("2026-08-18\n", encoding="utf-8")
+        (p / "features" / "sh000300" / "close.day.bin").write_bytes(b"\x00" * 8)
+
+        insts = [f"SH60{i:04d}" for i in range(300)]
+        # csi300 membership 截止到 2021-06-11
+        csi_lines = [f"{inst}\t2005-01-01\t2021-06-11\n" for inst in insts]
+        (p / "instruments" / "csi300.txt").write_text("".join(csi_lines), encoding="utf-8")
+        all_lines = [f"{inst}\t2005-01-01\t2026-08-18\n" for inst in insts]
+        (p / "instruments" / "all.txt").write_text("".join(all_lines), encoding="utf-8")
+
+        for inst in insts:
+            inst_dir = p / "features" / inst.lower()
+            inst_dir.mkdir(parents=True)
+            (inst_dir / "factor.day.bin").write_bytes(b"\x00" * 8)
+
+        with patch("ashare_quant.data.qlib_exporter.get_expected_latest_completed_trade_date", return_value="2026-08-18"):
+            status = get_qlib_provider_status(provider_uri=str(p))
+            assert status["status"] == "BROKEN"
+            assert "CSI300 instrument membership is stale" in status["status_message"]
+            assert status["csi300_membership_max_end"] == "2021-06-11"
+            assert status["csi300_active_count_on_expected_date"] == 0
+            assert status["csi300_membership_fresh"] is False
+
+
+def test_csi300_membership_current_is_ready():
+    """
+    验证 CSI300 Point-in-Time membership 覆盖 expected_latest_market_date (2026-08-18) 且 active 数量在 280~320 (如 300) 时，membership guard pass 且 status 为 READY
+    """
+    from ashare_quant.data.qlib_exporter import get_qlib_provider_status
+    import tempfile
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p = Path(tmpdir)
+        (p / "calendars").mkdir(parents=True)
+        (p / "instruments").mkdir(parents=True)
+        (p / "features" / "sh000300").mkdir(parents=True)
+
+        (p / "calendars" / "day.txt").write_text("2026-08-18\n", encoding="utf-8")
+        (p / "features" / "sh000300" / "close.day.bin").write_bytes(b"\x00" * 8)
+
+        insts = [f"SH60{i:04d}" for i in range(300)]
+        # csi300 membership 覆盖 2026-08-18
+        csi_lines = [f"{inst}\t2005-01-01\t2026-12-31\n" for inst in insts]
+        (p / "instruments" / "csi300.txt").write_text("".join(csi_lines), encoding="utf-8")
+        (p / "instruments" / "all.txt").write_text("".join(csi_lines), encoding="utf-8")
+
+        for inst in insts:
+            inst_dir = p / "features" / inst.lower()
+            inst_dir.mkdir(parents=True)
+            (inst_dir / "factor.day.bin").write_bytes(b"\x00" * 8)
+
+        with patch("ashare_quant.data.qlib_exporter.get_expected_latest_completed_trade_date", return_value="2026-08-18"):
+            status = get_qlib_provider_status(provider_uri=str(p))
+            assert status["status"] == "READY"
+            assert status["csi300_membership_fresh"] is True
+            assert status["csi300_active_count_on_expected_date"] == 300
+            assert status["csi300_membership_max_end"] == "2026-12-31"
+
+
+def test_daily_signal_rejects_stale_csi300_membership():
+    """
+    验证 daily-signal 在 target_date is None 时，若 calendar 最新但 CSI300 membership 过期必须抛出 StaleMarketDataError 并提示 CSI300 instrument membership is stale
+    """
+    from ashare_quant.signals.daily import DailySignalPipeline, StaleMarketDataError
+    from unittest.mock import patch
+    import tempfile
+
+    pipeline = DailySignalPipeline()
+    # 模拟场景：calendar 到达 2026-08-18，但 csi300.txt 依然停留在 2021-06-11
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p = Path(tmpdir)
+        (p / "calendars").mkdir(parents=True)
+        (p / "instruments").mkdir(parents=True)
+        (p / "features" / "sh000300").mkdir(parents=True)
+        (p / "calendars" / "day.txt").write_text("2020-01-02\n2026-08-18\n", encoding="utf-8")
+        (p / "instruments" / "csi300.txt").write_text("SH600000\t2005-01-01\t2021-06-11\n", encoding="utf-8")
+        (p / "instruments" / "all.txt").write_text("SH600000\t2005-01-01\t2026-08-18\n", encoding="utf-8")
+        (p / "features" / "sh000300" / "close.day.bin").write_bytes(b"\x00" * 8)
+
+        with patch("ashare_quant.data.qlib_exporter.QlibDataProviderManager.init_qlib", return_value=str(p)):
+            with patch("ashare_quant.signals.daily.get_expected_latest_completed_trade_date", return_value="2026-08-18"):
+                with pytest.raises(StaleMarketDataError) as excinfo:
+                    pipeline.run_daily_pipeline(target_date=None)
+                assert "CSI300 instrument membership is stale" in str(excinfo.value)
+
+
 # ======================= Integration Tests =======================
 
 @pytest.mark.integration

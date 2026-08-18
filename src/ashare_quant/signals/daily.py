@@ -173,6 +173,21 @@ class DailySignalPipeline:
             calendar_dates = [line.strip() for line in cal_file.read_text(encoding="utf-8").splitlines() if line.strip()]
             provider_data_end_date = calendar_dates[-1]
 
+            # CSI300 Point-in-Time Membership 解析
+            csi300_file = Path(resolved_uri) / "instruments" / "csi300.txt"
+            if not csi300_file.exists():
+                raise FileNotFoundError(f"Missing required Qlib CSI300 instruments file: '{csi300_file}'")
+
+            membership_records = []
+            for line in csi300_file.read_text(encoding="utf-8").splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 3:
+                    membership_records.append((parts[0], parts[1], parts[2]))
+                elif len(parts) >= 1:
+                    membership_records.append((parts[0], "2000-01-01", "2099-12-31"))
+
+            max_membership_end = max((r[2] for r in membership_records), default="N/A")
+
             # Provider Freshness Guard: 校验 Provider 是否过期
             if target_date is None:
                 expected_latest_market_date = get_expected_latest_completed_trade_date()
@@ -181,6 +196,21 @@ class DailySignalPipeline:
                         f"Qlib provider market data is STALE! Expected latest completed market date: '{expected_latest_market_date}', "
                         f"but Qlib provider data ends at: '{provider_data_end_date}'. Daily Signal generation for today is blocked. "
                         f"Please update Qlib provider data, or pass --date <HISTORICAL_DATE> to replay historical signals."
+                    )
+                # CSI300 Membership Freshness Guard for today
+                if max_membership_end < expected_latest_market_date:
+                    raise StaleMarketDataError(
+                        f"CSI300 instrument membership is stale! Max membership end '{max_membership_end}' "
+                        f"is older than expected market date '{expected_latest_market_date}'. "
+                        f"Daily Signal generation for today is blocked. Please update Qlib instruments/csi300.txt, "
+                        f"or pass --date <HISTORICAL_DATE> to replay historical signals."
+                    )
+                active_csi300 = set(r[0] for r in membership_records if r[1] <= expected_latest_market_date <= r[2])
+                active_count = len(active_csi300)
+                if active_count < 280 or active_count > 320:
+                    raise StaleMarketDataError(
+                        f"CSI300 instrument membership invalid on '{expected_latest_market_date}': {active_count} active constituents "
+                        f"(expected 280~320). Please update Qlib instruments/csi300.txt."
                     )
                 calc_date = provider_data_end_date
             else:
@@ -192,6 +222,15 @@ class DailySignalPipeline:
                     )
                 if target_date not in calendar_dates:
                     raise ValueError(f"ERROR: requested date unavailable in Qlib calendar: '{target_date}'.")
+
+                # CSI300 Membership Check for historical date
+                active_csi300 = set(r[0] for r in membership_records if r[1] <= target_date <= r[2])
+                active_count = len(active_csi300)
+                if active_count < 280 or active_count > 320:
+                    raise ValueError(
+                        f"CSI300 instrument membership invalid on historical date '{target_date}': {active_count} active constituents "
+                        f"(expected 280~320)."
+                    )
                 calc_date = target_date
 
             logger.info(f"Computing official Qlib Alpha158 features for date '{calc_date}' (Provider End: {provider_data_end_date})...")
